@@ -2,7 +2,7 @@ name: xrpbot
 
 on:
   schedule:
-    - cron: "*/30 * * * *"   # هر 30 دقیقه (به وقت UTC)
+    - cron: "*/5 * * * *"   # هر 5 دقیقه     # هر 1 دقیقه (به وقت UTC)
   workflow_dispatch:         # دکمه Run دستی
 
 concurrency:

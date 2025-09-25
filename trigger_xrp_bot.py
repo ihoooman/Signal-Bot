@@ -12,7 +12,7 @@ TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID")
 CRYPTOCOMPARE_API_KEY = os.getenv("CRYPTOCOMPARE_API_KEY")
 
 # اگر True فقط موقع سیگنال "خرید/فروش" پیام می‌دهد (وگرنه همیشه گزارش می‌دهد)
-SEND_ONLY_ON_TRIGGER = False
+SEND_ONLY_ON_TRIGGER = True
 
 # ===== Thresholds (قابل تغییر) =====
 BUY_RSI_D_MIN   = 55   # Daily RSI برای خرید
