@@ -5,6 +5,11 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
 
+# در اکشن‌های گیت‌هاب، مسیر خانگی شما وجود ندارد؛ پس مسیر نسبی به خود فایل را پیش‌فرض می‌گیریم
+_DEFAULT_SUBS = os.path.join(os.path.dirname(__file__), "subscribers.json")
+_ALT_SUBS     = os.path.expanduser("~/xrpbot-1/subscribers.json")
+SUBSCRIBERS_PATH = os.getenv("SUBSCRIBERS_PATH", _DEFAULT_SUBS if os.path.exists(os.path.dirname(__file__)) else _ALT_SUBS)
+
 # ====== تنظیمات از .env ======
 load_dotenv(os.path.expanduser("~/xrpbot/.env"))
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
