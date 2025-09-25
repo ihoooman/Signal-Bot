@@ -1,0 +1,145 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+import os, requests, numpy as np, pandas as pd
+from datetime import datetime
+from zoneinfo import ZoneInfo
+from dotenv import load_dotenv
+
+# ====== تنظیمات از .env ======
+load_dotenv(os.path.expanduser("~/xrpbot/.env"))
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID")
+
+SEND_ONLY_ON_TRIGGER = False  # اگر True فقط موقع سیگنال "خرید" پیام می‌دهد
+
+SYMBOL = "XRPUSDT"
+BINANCE_KLINES = "https://api.binance.com/api/v3/klines"
+
+def fetch_klines(symbol, interval, limit=300):
+    url = f"{BINANCE_KLINES}?symbol={symbol}&interval={interval}&limit={limit}"
+    r = requests.get(url, timeout=20)
+    r.raise_for_status()
+    data = r.json()
+    cols = ["open_time","open","high","low","close","volume","close_time",
+            "qav","num_trades","taker_base","taker_quote","ignore"]
+    df = pd.DataFrame(data, columns=cols)
+    for c in ["open","high","low","close","volume"]:
+        df[c] = df[c].astype(float)
+    return df
+
+def ema(series, span): return series.ewm(span=span, adjust=False).mean()
+
+def rsi(series, period=14):
+    delta = series.diff()
+    up = np.where(delta > 0, delta, 0.0)
+    dn = np.where(delta < 0, -delta, 0.0)
+    roll_up = pd.Series(up, index=series.index).rolling(period).mean()
+    roll_dn = pd.Series(dn, index=series.index).rolling(period).mean()
+    rs = roll_up / (roll_dn + 1e-12)
+    return 100 - (100 / (1 + rs))
+
+def macd(series, fast=12, slow=26, signal=9):
+    ema_fast = ema(series, fast)
+    ema_slow = ema(series, slow)
+    macd_line = ema_fast - ema_slow
+    signal_line = ema(macd_line, signal)
+    hist = macd_line - signal_line
+    return macd_line, signal_line, hist
+
+def last_cross_up(line, signal):
+    if len(line) < 2: return False
+    return (line.iloc[-2] <= signal.iloc[-2]) and (line.iloc[-1] > signal.iloc[-1])
+
+def near(value, target, pct=0.01): return abs(value - target) <= target * pct
+
+def local_minima(series):
+    mins = []
+    for i in range(1, len(series)-1):
+        if series.iloc[i] < series.iloc[i-1] and series.iloc[i] <= series.iloc[i+1]:
+            mins.append(i)
+    return mins
+
+def bullish_divergence(price, rsi_series):
+    mp = local_minima(price)
+    mr = local_minima(rsi_series)
+    if len(mp) < 2 or len(mr) < 2: return False
+    i2, i1 = mp[-1], mp[-2]
+    r1 = min(mr, key=lambda j: abs(j - i1))
+    r2 = min(mr, key=lambda j: abs(j - i2))
+    return (price.iloc[i2] < price.iloc[i1]) and (rsi_series.iloc[r2] > rsi_series.iloc[r1])
+
+def tehran_now(): return datetime.now(ZoneInfo("Asia/Tehran")).strftime("%Y-%m-%d %H:%M:%S")
+
+def send_telegram(text):
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True}
+    requests.post(url, json=payload, timeout=20)
+
+def build_message(primary, secondary, ctx):
+    dt = tehran_now()
+    if primary or secondary:
+        tf = "Daily" if primary else "4h"
+        head = f"<b>BUY SIGNAL: XRP ✅</b>  |  <b>{tf}</b>  |  {dt}"
+    else:
+        head = f"<b>No signal ❌</b>  |  {dt}"
+    lines = [
+        head,
+        f"Price: <b>{ctx['price']:.4f}$</b>",
+        f"RSI14 (D/4h): {ctx['rsi_d']:.2f} / {ctx['rsi_h4']:.2f}",
+        f"MACD-Hist (D/4h): {ctx['hist_d']:.4f} / {ctx['hist_h4']:.4f}",
+        f"SMA50 (Daily): {ctx['sma50_d']:.4f}",
+        f"Support near (2.75±1% or recent low): {ctx['support_ok']}, Divergence: {ctx['div_ok']}",
+        "",
+        "Sources: TradingView (XRP/USD), Binance XRP/USDT, CoinMarketCap"
+    ]
+    return "\n".join(lines)
+
+def main():
+    # --- Daily
+    d1 = fetch_klines(SYMBOL, "1d", limit=200)
+    close_d = d1["close"]
+    rsi_d = rsi(close_d, 14)
+    macd_d, sig_d, hist_d = macd(close_d, 12, 26, 9)
+    sma50_d = close_d.rolling(50).mean()
+
+    primary = last_cross_up(macd_d, sig_d) and (rsi_d.iloc[-1] > 55) and (close_d.iloc[-1] > sma50_d.iloc[-1])
+
+    # --- 4h
+    h4 = fetch_klines(SYMBOL, "4h", limit=300)
+    close_h4 = h4["close"]
+    rsi_h4 = rsi(close_h4, 14)
+    macd_h4, sig_h4, hist_h4 = macd(close_h4, 12, 26, 9)
+    price_now = float(close_h4.iloc[-1])
+
+    recent_low = close_h4.tail(30).min()
+    near_275 = near(price_now, 2.75, pct=0.01)
+    near_recent = near(price_now, recent_low, pct=0.01)
+    support_ok = near_275 or near_recent
+
+    rsi_ok = 35 <= float(rsi_h4.iloc[-1]) <= 45
+    div_ok = bullish_divergence(close_h4, rsi_h4)
+    macd_hist_ok = float(hist_h4.iloc[-1]) > 0
+    secondary = support_ok and rsi_ok and div_ok and macd_hist_ok
+
+    ctx = dict(
+        price=price_now,
+        rsi_d=float(rsi_d.iloc[-1]),
+        rsi_h4=float(rsi_h4.iloc[-1]),
+        hist_d=float(hist_d.iloc[-1]),
+        hist_h4=float(hist_h4.iloc[-1]),
+        sma50_d=float(sma50_d.iloc[-1]),
+        support_ok=support_ok,
+        div_ok=div_ok,
+    )
+
+    msg = build_message(primary, secondary, ctx)
+
+    if SEND_ONLY_ON_TRIGGER:
+        if primary or secondary:
+            send_telegram(msg)
+    else:
+        send_telegram(msg)
+
+if __name__ == "__main__":
+    main()
+
