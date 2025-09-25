@@ -2,8 +2,8 @@ name: xrpbot
 
 on:
   schedule:
-    - cron: "*/5 * * * *"   # هر 5 دقیقه     # هر 1 دقیقه (به وقت UTC)
-  workflow_dispatch:         # دکمه Run دستی
+    - cron: "*/5 * * * *"   # هر 5 دقیقه (UTC)
+  workflow_dispatch:         # اجرای دستی از تب Actions
 
 concurrency:
   group: xrpbot
@@ -23,7 +23,9 @@ jobs:
 
       - run: pip install --upgrade pip && pip install -r requirements.txt
 
-      - env:
+      - name: Run bot
+        env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
+          CRYPTOCOMPARE_API_KEY: ${{ secrets.CRYPTOCOMPARE_API_KEY }}
         run: python trigger_xrp_bot.py
