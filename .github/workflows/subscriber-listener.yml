@@ -1,0 +1,41 @@
+name: subscriber-listener
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"   # هر 5 دقیقه (پایدارتر)
+  workflow_dispatch:
+
+permissions:
+  contents: write   # تا بتوانیم تغییرات subscribers.json/offset.json را پوش کنیم
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # تا بتوانیم diff و commit بسازیم
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - run: pip install requests
+
+      - name: Run listener to capture /start
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+        run: python listen_updates.py
+
+      - name: Commit & push if changed
+        run: |
+          git config user.name  "xrpbot-bot"
+          git config user.email "actions@github.com"
+          if ! git diff --quiet -- subscribers.json offset.json; then
+            git add subscribers.json offset.json
+            git commit -m "update subscribers [skip ci]"
+            git push
+          else
+            echo "No subscriber changes."
+          fi
