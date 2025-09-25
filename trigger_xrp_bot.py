@@ -9,6 +9,7 @@ from dotenv import load_dotenv
 load_dotenv(os.path.expanduser("~/xrpbot/.env"))
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID")
+CRYPTOCOMPARE_API_KEY = os.getenv("CRYPTOCOMPARE_API_KEY")
 
 # اگر True فقط موقع سیگنال "خرید/فروش" پیام می‌دهد (وگرنه همیشه گزارش می‌دهد)
 SEND_ONLY_ON_TRIGGER = False
@@ -31,24 +32,34 @@ NEAR_PCT             = 0.01  # 1% نزدیکی ساپورت/مقاومت
 
 # دارایی‌ها: XRP + BTC + ETH + SOL
 SYMBOLS = [
-    ("XRPUSDT", "XRP"),
-    ("BTCUSDT", "BTC"),
-    ("ETHUSDT", "ETH"),
-    ("SOLUSDT", "SOL"),
+    ("XRP", "XRP"),
+    ("BTC", "BTC"),
+    ("ETH", "ETH"),
+    ("SOL", "SOL"),
 ]
 
-BINANCE_KLINES = "https://api.binance.com/api/v3/klines"
+CRYPTOCOMPARE_BASE = "https://min-api.cryptocompare.com/data/v2"
 
 # ===================== ابزار داده و اندیکاتورها =====================
 
-def fetch_klines(symbol, interval, limit=300):
-    url = f"{BINANCE_KLINES}?symbol={symbol}&interval={interval}&limit={limit}"
-    r = requests.get(url, timeout=20)
+def fetch_cc(fsym: str, tsym: str, timeframe: str, limit=300):
+    """Fetch OHLCV from CryptoCompare. timeframe: '1d' or '4h' (aggregated)."""
+    if timeframe == "1d":
+        url = f"{CRYPTOCOMPARE_BASE}/histoday?fsym={fsym}&tsym={tsym}&limit={limit}"
+    elif timeframe == "4h":
+        url = f"{CRYPTOCOMPARE_BASE}/histohour?fsym={fsym}&tsym={tsym}&aggregate=4&limit={limit}"
+    else:
+        raise ValueError("Unsupported timeframe")
+    headers = {"Authorization": f"Apikey {CRYPTOCOMPARE_API_KEY}"} if CRYPTOCOMPARE_API_KEY else {}
+    r = requests.get(url, headers=headers, timeout=20)
     r.raise_for_status()
-    data = r.json()
-    cols = ["open_time","open","high","low","close","volume","close_time",
-            "qav","num_trades","taker_base","taker_quote","ignore"]
-    df = pd.DataFrame(data, columns=cols)
+    j = r.json()
+    if j.get("Response") != "Success":
+        raise RuntimeError(f"CryptoCompare error: {j.get('Message')}")
+    d = j["Data"]["Data"]
+    df = pd.DataFrame(d)
+    # Columns: time, high, low, open, close, volumefrom, volumeto
+    df.rename(columns={"volumeto": "volume"}, inplace=True)
     for c in ["open","high","low","close","volume"]:
         df[c] = df[c].astype(float)
     return df
@@ -221,8 +232,8 @@ def build_message_block(symbol_name, signal_type, timeframe, ctx, prob=None, avg
 # ===================== منطق هر نماد =====================
 
 def evaluate_symbol(symbol: str, name: str):
-    # Daily
-    d1 = fetch_klines(symbol, "1d", limit=220)
+    # Daily (CryptoCompare)
+    d1 = fetch_cc(symbol, "USD", "1d", limit=220)
     close_d = d1["close"]
     rsi_d = rsi(close_d, 14)
     macd_d, sig_d, hist_d = macd(close_d, 12, 26, 9)
@@ -232,8 +243,8 @@ def evaluate_symbol(symbol: str, name: str):
     primary = last_cross_up(macd_d, sig_d) and (rsi_d.iloc[-1] > BUY_RSI_D_MIN) and (close_d.iloc[-1] > sma50_d.iloc[-1])
     sell_primary = last_cross_down(macd_d, sig_d) and (rsi_d.iloc[-1] < SELL_RSI_D_MAX) and (close_d.iloc[-1] < sma50_d.iloc[-1])
 
-    # 4h
-    h4 = fetch_klines(symbol, "4h", limit=320)
+    # 4h (CryptoCompare)
+    h4 = fetch_cc(symbol, "USD", "4h", limit=320)
     close_h4 = h4["close"]
     rsi_h4 = rsi(close_h4, 14)
     macd_h4, sig_h4, hist_h4 = macd(close_h4, 12, 26, 9)
@@ -326,7 +337,7 @@ def main():
         except Exception as e:
             blocks.append(f"<b>{name}</b> — error: {e}")
 
-    text = "\n\n".join(blocks) + "\n\nSources: TradingView (USD pairs), Binance, CoinMarketCap"
+    text = "\n\n".join(blocks) + "\n\nSources: TradingView (USD pairs), CryptoCompare, CoinMarketCap"
 
     if SEND_ONLY_ON_TRIGGER:
         if any_signal:
