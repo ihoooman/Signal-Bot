@@ -20,7 +20,7 @@ Automated crypto signal engine that analyses XRP, BTC, ETH, and SOL across daily
 ## Quickstart
 ```bash
 # 1) Clone the repo
-git clone https://github.com/<your-username>/xrp-signal-bot.git
+git clone [https://github.com/<your-username>/xrp-signal-bot.git](https://github.com/ihoooman/Signal-Bot.git)
 cd xrp-signal-bot
 
 # 2) Spin up a virtual environment
