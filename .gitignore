@@ -1,4 +1,25 @@
-.env
-*.log
+# Python build
 __pycache__/
-*.pyc
+*.py[cod]
+*.so
+
+# Environments
+.venv/
+venv/
+ENV/
+bin/
+lib/
+pyvenv.cfg
+
+# Secrets & runtime data
+.env
+.env.*
+!.env.example
+subscribers.json
+offset.json
+*.log
+
+# Editors
+.vscode/
+.idea/
+.DS_Store

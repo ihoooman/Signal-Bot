@@ -1,8 +1,21 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 import os, json, requests
+from pathlib import Path
+from dotenv import load_dotenv
 
-TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
+REPO_ROOT = Path(__file__).resolve().parent
+for candidate in (os.getenv("ENV_FILE"), REPO_ROOT / ".env", Path("~/xrpbot/.env").expanduser()):
+    if not candidate:
+        continue
+    candidate_path = Path(candidate).expanduser()
+    if candidate_path.exists():
+        load_dotenv(candidate_path)
+        break
+
+TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+if not TOKEN:
+    raise RuntimeError("TELEGRAM_BOT_TOKEN is required to read Telegram updates")
 API   = f"https://api.telegram.org/bot{TOKEN}"
 
 ROOT = os.path.dirname(__file__)

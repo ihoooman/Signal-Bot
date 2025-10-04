@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+import json
 import os, requests, numpy as np, pandas as pd
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
+from pathlib import Path
 
 # در اکشن‌های گیت‌هاب، مسیر خانگی شما وجود ندارد؛ پس مسیر نسبی به خود فایل را پیش‌فرض می‌گیریم
 _DEFAULT_SUBS = os.path.join(os.path.dirname(__file__), "subscribers.json")
@@ -11,10 +13,59 @@ _ALT_SUBS     = os.path.expanduser("~/xrpbot-1/subscribers.json")
 SUBSCRIBERS_PATH = os.getenv("SUBSCRIBERS_PATH", _DEFAULT_SUBS if os.path.exists(os.path.dirname(__file__)) else _ALT_SUBS)
 
 # ====== تنظیمات از .env ======
-load_dotenv(os.path.expanduser("~/xrpbot/.env"))
+_REPO_ROOT = Path(__file__).resolve().parent
+_ENV_CANDIDATES = [
+    os.getenv("ENV_FILE"),
+    _REPO_ROOT / ".env",
+    Path("~/xrpbot/.env").expanduser(),
+]
+
+for _candidate in _ENV_CANDIDATES:
+    if not _candidate:
+        continue
+    _candidate_path = Path(_candidate).expanduser()
+    if _candidate_path.exists():
+        load_dotenv(_candidate_path)
+        break
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID")
 CRYPTOCOMPARE_API_KEY = os.getenv("CRYPTOCOMPARE_API_KEY")
+
+if not TELEGRAM_BOT_TOKEN:
+    raise RuntimeError("TELEGRAM_BOT_TOKEN is required (set in .env or environment)")
+
+
+def load_subscribers(path: Path) -> list[str]:
+    """Load Telegram chat IDs from JSON list. Returns empty list if missing."""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return []
+    except Exception as exc:
+        raise RuntimeError(f"Failed to read subscribers file at {path}: {exc}") from exc
+
+    if not isinstance(data, list):
+        raise RuntimeError(f"Subscribers file {path} must contain a JSON list of chat IDs")
+
+    seen = set()
+    subscribers: list[str] = []
+    for entry in data:
+        chat_id = str(entry).strip()
+        if not chat_id:
+            continue
+        if chat_id not in seen:
+            seen.add(chat_id)
+            subscribers.append(chat_id)
+    return subscribers
+
+
+def resolve_chat_ids(subscribers: list[str], fallback_chat_id: str | None) -> list[str]:
+    if subscribers:
+        return subscribers
+    if fallback_chat_id:
+        return [str(fallback_chat_id)]
+    return []
+
 
 # اگر True فقط موقع سیگنال "خرید/فروش" پیام می‌دهد (وگرنه همیشه گزارش می‌دهد)
 SEND_ONLY_ON_TRIGGER = True
@@ -201,10 +252,23 @@ def historical_flags_4h(close_h: pd.Series, rsi_h: pd.Series, hist_h: pd.Series,
 def tehran_now():
     return datetime.now(ZoneInfo("Asia/Tehran")).strftime("%Y-%m-%d %H:%M:%S")
 
-def send_telegram(text):
+def send_telegram(chat_id: str, text: str):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True}
-    requests.post(url, json=payload, timeout=20)
+    payload = {"chat_id": chat_id, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True}
+    resp = requests.post(url, json=payload, timeout=20)
+    if resp.status_code >= 400:
+        raise RuntimeError(f"Telegram API error for chat {chat_id}: {resp.status_code} {resp.text}")
+
+
+def broadcast(text: str, chat_ids: list[str]):
+    errors: list[str] = []
+    for chat_id in chat_ids:
+        try:
+            send_telegram(chat_id, text)
+        except Exception as exc:
+            errors.append(f"{chat_id}: {exc}")
+    if errors:
+        raise RuntimeError("Failed to send to some chats: " + ", ".join(errors))
 
 def build_message_block(symbol_name, signal_type, timeframe, ctx, prob=None, avg_ret=None, horizon_label=""):
     dt = tehran_now()
@@ -330,6 +394,14 @@ def evaluate_symbol(symbol: str, name: str):
 # ===================== اجرای اصلی =====================
 
 def main():
+    subs_path = Path(SUBSCRIBERS_PATH).expanduser()
+    subscribers = load_subscribers(subs_path)
+    chat_ids = resolve_chat_ids(subscribers, TELEGRAM_CHAT_ID)
+    if not chat_ids:
+        raise RuntimeError(
+            "No Telegram chat IDs configured. Set TELEGRAM_CHAT_ID or add IDs to subscribers.json"
+        )
+
     blocks = []
     any_signal = False
 
@@ -346,9 +418,9 @@ def main():
 
     if SEND_ONLY_ON_TRIGGER:
         if any_signal:
-            send_telegram(text)
+            broadcast(text, chat_ids)
     else:
-        send_telegram(text)
+        broadcast(text, chat_ids)
 
 if __name__ == "__main__":
     main()
