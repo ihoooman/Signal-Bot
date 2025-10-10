@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+import asyncio
+import inspect
 import os, json, math, re, requests, sys, time, uuid
 from pathlib import Path
 from dotenv import load_dotenv
@@ -94,6 +96,35 @@ STATE_FILE = Path(os.getenv("CONVERSATION_STATE_PATH", str(ROOT / "conversation_
 SNAPSHOT_PATH = Path(os.getenv("SNAPSHOT_PATH", str(ROOT / "data" / "last_summary.json"))).expanduser()
 
 ALLOWED_UPDATES = ("message", "callback_query", "pre_checkout_query")
+
+
+def _run_bot_get_updates(offset: int, timeout_value: int):
+    async def _invoke():
+        result = BOT.get_updates(
+            offset=offset,
+            timeout=timeout_value,
+            allowed_updates=ALLOWED_UPDATES,
+        )
+        if inspect.isawaitable(result):
+            return await result
+        awaitable = getattr(result, "__await__", None)
+        if callable(awaitable):
+            return await result  # type: ignore[func-returns-value]
+        return result
+
+    try:
+        return asyncio.run(_invoke())
+    except RuntimeError as exc:
+        if "asyncio.run()" in str(exc):
+            loop = asyncio.new_event_loop()
+            try:
+                asyncio.set_event_loop(loop)
+                return loop.run_until_complete(_invoke())
+            finally:
+                asyncio.set_event_loop(None)
+                loop.close()
+        raise
+
 
 def _parse_donation_tiers(raw: str | None) -> list[int]:
     tiers: list[int] = []
@@ -962,11 +993,14 @@ def handle_get_updates_now(chat_id: int | str) -> None:
 def _fetch_updates(offset: int, timeout: float) -> list[dict]:
     timeout_value = int(max(0, math.ceil(timeout)))
     try:
-        updates = BOT.get_updates(
-            offset=offset,
-            timeout=timeout_value,
-            allowed_updates=ALLOWED_UPDATES,
-        )
+        updates = _run_bot_get_updates(offset, timeout_value)
+        if updates is None:
+            return []
+        if not isinstance(updates, list):
+            try:
+                updates = list(updates)
+            except TypeError:
+                updates = [updates]
     except RetryAfter as exc:  # pragma: no cover - network timing
         sleep_for = getattr(exc, "retry_after", 1)
         time.sleep(float(sleep_for))
