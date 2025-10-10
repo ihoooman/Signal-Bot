@@ -5,7 +5,6 @@
 import asyncio
 import threading
 from typing import Optional
-from listen_start import on_start
 
 import listen_start
 
@@ -259,6 +258,8 @@ class _LegacyPollingWorker:
             "remove",
             "/donate",
             "donate",
+            "/start",
+            "start"
         }
         if text_lower in contact_required_commands:
             handled, changed = listen_start.ensure_contact_prompt(existing, chat_id)
@@ -440,5 +441,4 @@ def run_polling_main() -> None:
         .build()
     )
     app.add_handler(TypeHandler(Update, _dispatch))
-    app.add_handler(CommandHandler("start", on_start))
     app.run_polling(drop_pending_updates=True, stop_signals=None)
