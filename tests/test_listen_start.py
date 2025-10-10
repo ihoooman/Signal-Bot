@@ -45,6 +45,24 @@ class AddAssetFlowTests(unittest.TestCase):
         self.prev_tiers = listen_start.DONATION_TIERS
         listen_start.DONATION_TIERS = [100, 500, 1000]
         self.addCleanup(setattr, listen_start, "DONATION_TIERS", self.prev_tiers)
+        listen_start._tehran_zone.cache_clear()
+        self.addCleanup(listen_start._tehran_zone.cache_clear)
+
+    def _sample_summary(self):
+        return {
+            "generated_at": "2024-01-01 00:00:00",
+            "counts": {
+                "BUY": 1,
+                "SELL": 0,
+                "NO_ACTION": 2,
+                "emergencies_last_4h": 1,
+            },
+            "highlights": [
+                {"symbol": "BTCUSDT", "line": "Signal"},
+                {"symbol": "ETHUSDT", "line": "Hold"},
+            ],
+            "per_user_overrides": False,
+        }
 
     def test_handle_add_asset_text_adds_pair_and_clears_state(self):
         state = {"conversations": {"1": {"state": "await_symbol"}}}
@@ -97,21 +115,43 @@ class AddAssetFlowTests(unittest.TestCase):
         mock_send.assert_any_call("1", mock.ANY)
         mock_menu.assert_called_once_with("1")
 
-    def test_handle_get_updates_now_reads_snapshot(self):
-        payload = {
-            "generated_at": "2024-01-01T00:00:00",
-            "counts": {"BUY": 1, "SELL": 2, "NO_ACTION": 3, "emergencies_last_4h": 1},
-            "highlights": [{"symbol": "BTCUSDT", "line": "BUY"}],
-            "per_user_overrides": False,
-        }
-        self.snapshot_path.write_text(json.dumps(payload), encoding="utf-8")
-        with mock.patch.object(listen_start, "send_telegram") as mock_send:
-            listen_start.handle_get_updates_now("42")
+    def test_handle_get_updates_now_triggers_live_summary(self):
+        listen_start.upsert_subscriber(42, phone_number="+100", path=self.subs_path)
+        summary = self._sample_summary()
+        with mock.patch.object(
+            listen_start, "run_summary_once", return_value=summary
+        ) as mock_run, mock.patch.object(listen_start, "send_telegram") as mock_send:
+            listen_start.handle_get_updates_now(42)
 
+        mock_run.assert_called_once()
         mock_send.assert_called_once()
-        sent_text = mock_send.call_args[0][1]
-        self.assertIn("BUY", sent_text)
-        self.assertIn("BTCUSDT", sent_text)
+        saved = json.loads(self.snapshot_path.read_text(encoding="utf-8"))
+        self.assertEqual(saved["counts"], summary["counts"])
+
+    def test_get_uses_live_compute_when_no_snapshot(self):
+        listen_start.upsert_subscriber(99, phone_number="+101", path=self.subs_path)
+        summary = self._sample_summary()
+        with mock.patch.object(
+            listen_start, "run_summary_once", return_value=summary
+        ) as mock_run, mock.patch.object(listen_start, "send_telegram") as mock_send:
+            result = listen_start.send_summary_for_chat(99)
+
+        mock_run.assert_called_once()
+        mock_send.assert_called_once()
+        self.assertEqual(result["counts"], summary["counts"])
+        self.assertTrue(self.snapshot_path.exists())
+
+    def test_get_uses_snapshot_when_fresh(self):
+        payload = self._sample_summary()
+        listen_start._save_snapshot(payload)
+        with mock.patch.object(listen_start, "_snapshot_is_fresh", return_value=True), \
+            mock.patch.object(listen_start, "run_summary_once") as mock_run, \
+            mock.patch.object(listen_start, "send_telegram") as mock_send:
+            result = listen_start.send_summary_for_chat(123)
+
+        mock_run.assert_not_called()
+        mock_send.assert_called_once()
+        self.assertEqual(result, payload)
 
     def test_prehandle_get_returns_snapshot(self):
         payload = {
@@ -140,10 +180,10 @@ class AddAssetFlowTests(unittest.TestCase):
             listen_start,
             "_run_bot_get_updates",
             return_value=[FakeUpdate(update_payload)],
-        ), mock.patch.object(listen_start, "send_telegram") as mock_send:
+        ), mock.patch.object(listen_start, "send_summary_for_chat") as mock_summary:
             listen_start.process_updates(duration_seconds=0, poll_timeout=0)
 
-        mock_send.assert_called_once()
+        mock_summary.assert_called_once_with(123)
         self.assertTrue(self.offset_path.exists())
 
     def test_donate_command_invokes_handler(self):

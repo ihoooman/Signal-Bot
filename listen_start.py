@@ -4,7 +4,9 @@ import asyncio
 import inspect
 import os, json, math, re, requests, sys, time, uuid
 from datetime import datetime, timedelta, timezone
+from functools import lru_cache
 from pathlib import Path
+from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
 try:
     from telegram import Bot as TelegramBot
@@ -37,7 +39,7 @@ from subscriptions import (
     save_donation,
     upsert_subscriber,
 )
-from trigger_xrp_bot import send_telegram
+from trigger_xrp_bot import render_compact_summary, run_summary_once, send_telegram
 
 REPO_ROOT = Path(__file__).resolve().parent
 for candidate in (os.getenv("ENV_FILE"), REPO_ROOT / ".env", Path("~/xrpbot/.env").expanduser()):
@@ -96,6 +98,7 @@ OFFSET_FILE = Path(os.getenv("OFFSET_FILE", str(ROOT / "data" / "offset.txt"))).
 LEGACY_OFFSET_FILE = Path(os.getenv("LEGACY_OFFSET_FILE", str(ROOT / "offset.json"))).expanduser()
 STATE_FILE = Path(os.getenv("CONVERSATION_STATE_PATH", str(ROOT / "conversation_state.json"))).expanduser()
 SNAPSHOT_PATH = Path(os.getenv("SNAPSHOT_PATH", str(ROOT / "data" / "last_summary.json"))).expanduser()
+SNAPSHOT_MAX_AGE = timedelta(hours=2)
 
 ALLOWED_UPDATES = ("message", "callback_query", "pre_checkout_query")
 
@@ -331,9 +334,44 @@ def save_state(state: dict) -> None:
     save_json(STATE_FILE, state)
 
 
-def load_snapshot() -> dict | None:
+@lru_cache(maxsize=1)
+def _tehran_zone() -> ZoneInfo:
+    tz_name = os.getenv("TIMEZONE", "Asia/Tehran")
     try:
-        with open(SNAPSHOT_PATH, "r", encoding="utf-8") as f:
+        return ZoneInfo(tz_name)
+    except Exception:
+        return ZoneInfo("Asia/Tehran")
+
+
+def _parse_summary_timestamp(value: str | None) -> datetime | None:
+    if not value or not isinstance(value, str):
+        return None
+    raw = value.strip()
+    if not raw:
+        return None
+
+    tz = _tehran_zone()
+    try:
+        parsed = datetime.fromisoformat(raw)
+    except ValueError:
+        for fmt in ("%Y-%m-%d %H:%M:%S",):
+            try:
+                parsed = datetime.strptime(raw, fmt)
+            except ValueError:
+                continue
+            else:
+                return parsed.replace(tzinfo=tz)
+        return None
+
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=tz)
+    return parsed.astimezone(tz)
+
+
+def _load_snapshot(path: Path | None = None) -> dict | None:
+    candidate = Path(path) if path else SNAPSHOT_PATH
+    try:
+        with open(candidate, "r", encoding="utf-8") as f:
             data = json.load(f)
     except FileNotFoundError:
         return None
@@ -342,6 +380,35 @@ def load_snapshot() -> dict | None:
     if not isinstance(data, dict):
         return None
     return data
+
+
+def _save_snapshot(payload: dict, path: Path | None = None) -> None:
+    candidate = Path(path) if path else SNAPSHOT_PATH
+    candidate.parent.mkdir(parents=True, exist_ok=True)
+    with open(candidate, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2, sort_keys=True)
+
+
+def _snapshot_is_fresh(snapshot: dict | None, *, max_age: timedelta = SNAPSHOT_MAX_AGE) -> bool:
+    if not snapshot or not isinstance(snapshot, dict):
+        return False
+    generated = snapshot.get("generated_at")
+    if not isinstance(generated, str):
+        return False
+    parsed = _parse_summary_timestamp(generated)
+    if not parsed:
+        return False
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    now = datetime.now(parsed.tzinfo)
+    try:
+        return (now - parsed) <= max_age
+    except TypeError:
+        return False
+
+
+def load_snapshot() -> dict | None:
+    return _load_snapshot()
 
 
 def _conversation_bucket(state: dict) -> dict:
@@ -392,45 +459,53 @@ def _format_stars(amount: int) -> str:
     return f"{int(amount)}⭐"
 
 
-def _format_snapshot_message(snapshot: dict | None) -> str:
-    if not snapshot:
-        return (
-            "هنوز خلاصه‌ای ثبت نشده است. لطفاً پس از اجرای بعدی ربات دوباره تلاش کنید."
-        )
+def _send_summary_message(chat_id: int | str, payload: dict | None) -> None:
+    message = render_compact_summary(payload)
+    try:
+        send_telegram(str(chat_id), message)
+    except Exception as exc:  # pragma: no cover - network failure
+        print(f"Failed to send summary to {chat_id}: {exc}")
 
-    generated_at = snapshot.get("generated_at") or "—"
-    counts = snapshot.get("counts") or {}
-    emergencies = snapshot.get("counts", {}).get("emergencies_last_4h")
-    highlights = snapshot.get("highlights") or []
 
-    buy = counts.get("BUY", 0)
-    sell = counts.get("SELL", 0)
-    na = counts.get("NO_ACTION", 0)
-    emergency_line = (
-        f"🚨 سیگنال‌های اضطراری ۴ ساعت اخیر: {int(emergencies)}"
-        if emergencies is not None
-        else None
-    )
+def _run_live_summary(chat_id: int | str) -> dict:
+    watchlist = get_user_watchlist(chat_id, path=SUBS_FILE)
+    return run_summary_once(watchlist)
 
-    lines = [
-        "<b>📬 آخرین خلاصه</b>",
-        f"⏱ تولید شده در: {generated_at}",
-        "",
-        f"✅ BUY: <b>{buy}</b>",
-        f"⛔️ SELL: <b>{sell}</b>",
-        f"⚪️ NO ACTION: <b>{na}</b>",
-    ]
-    if emergency_line:
-        lines.extend(["", emergency_line])
 
-    if highlights:
-        lines.extend(["", "🎯 نکات برجسته:"])
-        for item in highlights[:5]:
-            pair = item.get("symbol") or "—"
-            text = item.get("line") or ""
-            lines.append(f"• <b>{pair}</b>: {text}")
+def send_summary_for_chat(chat_id: int | str, *, force_live: bool = False) -> dict | None:
+    snapshot: dict | None = None
+    if not force_live:
+        snapshot = _load_snapshot()
+        if snapshot and _snapshot_is_fresh(snapshot):
+            _send_summary_message(chat_id, snapshot)
+            return snapshot
 
-    return "\n".join(line for line in lines if line is not None)
+    try:
+        summary = _run_live_summary(chat_id)
+    except Exception as exc:
+        print(f"Failed to compute live summary for {chat_id}: {exc}")
+        if snapshot and not force_live:
+            try:
+                _send_summary_message(chat_id, snapshot)
+            except Exception as send_exc:  # pragma: no cover - network failure
+                print(f"Failed to deliver cached summary to {chat_id}: {send_exc}")
+            return snapshot
+        try:
+            send_telegram(
+                str(chat_id),
+                "محاسبه لحظه‌ای با خطا مواجه شد. لطفاً بعداً دوباره تلاش کنید.",
+            )
+        except Exception as send_exc:  # pragma: no cover - network failure
+            print(f"Failed to notify live summary error for {chat_id}: {send_exc}")
+        return None
+
+    try:
+        _save_snapshot(summary)
+    except Exception as exc:  # pragma: no cover - disk error
+        print(f"Failed to persist summary snapshot: {exc}")
+
+    _send_summary_message(chat_id, summary)
+    return summary
 
 
 def _build_donation_keyboard() -> dict:
@@ -1076,12 +1151,7 @@ def handle_remove_asset_confirm(
 
 
 def handle_get_updates_now(chat_id: int | str) -> None:
-    snapshot = load_snapshot()
-    message = _format_snapshot_message(snapshot)
-    try:
-        send_telegram(str(chat_id), message)
-    except Exception as exc:  # pragma: no cover
-        print(f"Failed to send snapshot to {chat_id}: {exc}")
+    send_summary_for_chat(chat_id, force_live=True)
 
 
 def _fetch_updates(offset: int, timeout: float) -> list[dict]:
@@ -1333,7 +1403,7 @@ def process_updates(duration_seconds: float | None = None, poll_timeout: float =
                     continue
 
                 if text_lower in ("/get", "get"):
-                    handle_get_updates_now(chat_id)
+                    send_summary_for_chat(chat_id)
                     continue
 
                 if text_lower in ("/donate", "donate"):
