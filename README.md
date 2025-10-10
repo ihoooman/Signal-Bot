@@ -127,11 +127,26 @@ If APScheduler is unavailable in your environment, `schedule_jobs.py` will log a
 - `.github/workflows/` — ready-to-use automation pipelines.
 - `.env.example` — starter template for configuration.
 
+## Render (Free Web Service)
+Deploying the long-polling bot on [Render](https://render.com/) as a free Web Service keeps everything in one process:
+
+- **Build Command:** `pip install -r requirements.txt`
+- **Start Command:** `python run.py`
+- **Environment Variables:**
+  - `BOT_TOKEN` (required)
+  - `DB_URL` (required when you use an external database; optional otherwise)
+  - `TIMEZONE=Asia/Tehran`
+  - Optional overrides: `ADMIN_CHAT_IDS`, `DONATION_TIERS`
+
+Render injects the `PORT` variable at runtime; `health.py` binds to it so Render detects the listening socket while `listen_updates` continues long-polling in parallel. The SQLite database (`subscribers.sqlite3`) and `data/offset.txt` should live on a persistent disk if you need state across deploys. To minimise cold starts you can ping the health endpoint with a keep-alive service such as UptimeRobot.
+
 ## Security checklist
 - Never commit `.env`, `subscribers.json`, or `data/offset.txt`. They are already ignored in `.gitignore`.
 - Rotate your Telegram bot token if it ever leaks.
 - Use a dedicated CryptoCompare key so you can monitor usage and revoke access without downtime.
 - When running on shared infrastructure, set `SUBSCRIBERS_DB_PATH` to a protected directory with restricted permissions.
+
+> **Security note:** If the bot token ever leaks, immediately rotate it via **@BotFather** and update the `BOT_TOKEN` environment variable on Render (or any other deployment target) before re-deploying.
 
 ## Contributing
 Interested in sharpening the signal logic, adding tickers, or wiring up alternative data providers? Open an issue or submit a pull request. Please run `python -m compileall .` (or your preferred checks) before sending a patch.
