@@ -38,7 +38,8 @@ cp .env.example .env
 Fill in `.env` with your secrets:
 
 ```
-TELEGRAM_BOT_TOKEN=bot-token-from-botfather
+BOT_TOKEN=bot-token-from-botfather
+# TELEGRAM_BOT_TOKEN=bot-token-from-botfather  # optional legacy fallback
 TELEGRAM_CHAT_ID=chat-or-channel-id (optional fallback)
 CRYPTOCOMPARE_API_KEY=cryptocompare-api-key (optional)
 # SUBSCRIBERS_DB_PATH=/absolute/path/to/subscribers.sqlite3 (optional override)

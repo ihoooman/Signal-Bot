@@ -1,7 +1,7 @@
 requests
 pandas
 numpy
-python-dotenv
+python-dotenv>=1.0.1
 tzdata
 APScheduler
 SQLAlchemy>=1.4

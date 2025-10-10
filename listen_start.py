@@ -45,10 +45,10 @@ for candidate in (os.getenv("ENV_FILE"), REPO_ROOT / ".env", Path("~/xrpbot/.env
         load_dotenv(candidate_path)
         break
 
-TOKEN = os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("BOT_TOKEN")
-if not TOKEN:
-    raise RuntimeError("TELEGRAM_BOT_TOKEN is required to read Telegram updates")
-API   = f"https://api.telegram.org/bot{TOKEN}"
+BOT_TOKEN = os.getenv("BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN")
+if not BOT_TOKEN:
+    raise RuntimeError("BOT_TOKEN is required to read Telegram updates")
+API   = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
 BROADCAST_SLEEP_MS = int(os.getenv("BROADCAST_SLEEP_MS", "0"))
 
@@ -82,9 +82,9 @@ class _RequestsBot:
 
 
 if TelegramBot is not None:
-    BOT = TelegramBot(TOKEN)
+    BOT = TelegramBot(BOT_TOKEN)
 else:  # pragma: no cover - fallback when dependency missing
-    BOT = _RequestsBot(TOKEN)
+    BOT = _RequestsBot(BOT_TOKEN)
 
 ROOT = Path(__file__).resolve().parent
 SUBS_FILE = Path(os.getenv("SUBSCRIBERS_DB_PATH") or os.getenv("SUBSCRIBERS_PATH", str(ROOT / "subscribers.sqlite3"))

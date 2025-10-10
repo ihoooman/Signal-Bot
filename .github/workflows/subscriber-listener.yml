@@ -21,12 +21,12 @@ jobs:
         with:
           python-version: '3.12'
 
-      - run: pip install requests
+      - run: pip install -r requirements.txt
 
       - name: Run listener to capture /start
         env:
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-        run: python listen_updates.py
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+        run: python -m src.signal_bot.ci_entry --mode prehandle
 
       - name: Commit & push if changed
         run: |
