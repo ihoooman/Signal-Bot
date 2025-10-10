@@ -7,8 +7,11 @@ from dotenv import load_dotenv
 
 # ====== تنظیمات از .env ======
 load_dotenv(os.path.expanduser("~/xrpbot/.env"))
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+BOT_TOKEN = os.getenv("BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID")
+
+if not BOT_TOKEN:
+    raise RuntimeError("BOT_TOKEN is required (set in .env or environment)")
 
 SEND_ONLY_ON_TRIGGER = False  # اگر True فقط موقع سیگنال "خرید" پیام می‌دهد
 
@@ -71,7 +74,7 @@ def bullish_divergence(price, rsi_series):
 def tehran_now(): return datetime.now(ZoneInfo("Asia/Tehran")).strftime("%Y-%m-%d %H:%M:%S")
 
 def send_telegram(text):
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True}
     requests.post(url, json=payload, timeout=20)
 

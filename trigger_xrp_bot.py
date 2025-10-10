@@ -50,14 +50,14 @@ for _candidate in _ENV_CANDIDATES:
     if _candidate_path.exists():
         load_dotenv(_candidate_path)
         break
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("BOT_TOKEN")
+BOT_TOKEN = os.getenv("BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID")
 CRYPTOCOMPARE_API_KEY = os.getenv("CRYPTOCOMPARE_API_KEY")
 BROADCAST_SLEEP_MS = int(os.getenv("BROADCAST_SLEEP_MS", "0"))
 _BACKOFF_SCHEDULE = (0.5, 1.0, 2.0)
 
-if not TELEGRAM_BOT_TOKEN:
-    raise RuntimeError("TELEGRAM_BOT_TOKEN is required (set in .env or environment)")
+if not BOT_TOKEN:
+    raise RuntimeError("BOT_TOKEN is required (set in .env or environment)")
 
 
 def resolve_chat_ids(subscribers: list[dict[str, str]], fallback_chat_id: str | None) -> list[str]:
@@ -281,7 +281,7 @@ def tehran_now():
     return datetime.now(tz).strftime("%Y-%m-%d %H:%M:%S")
 
 def send_telegram(chat_id: str, text: str):
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     payload = {"chat_id": chat_id, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True}
 
     for attempt, backoff in enumerate(_BACKOFF_SCHEDULE, start=1):

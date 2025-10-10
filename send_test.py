@@ -10,11 +10,11 @@ for candidate in (os.getenv("ENV_FILE"), repo_root / ".env", Path("~/xrpbot/.env
     if candidate_path.exists():
         load_dotenv(candidate_path)
         break
-TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TOKEN = os.getenv("BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 if not TOKEN or not CHAT_ID:
-    raise RuntimeError("Both TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID must be set for send_test.py")
+    raise RuntimeError("Both BOT_TOKEN and TELEGRAM_CHAT_ID must be set for send_test.py")
 
 msg = "سلام هومن! ✅ تست ارسال پیام از ربات انجام شد."
 url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"

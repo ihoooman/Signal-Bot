@@ -1,4 +1,5 @@
 import os
+os.environ.setdefault("BOT_TOKEN", "test-token")
 os.environ.setdefault("TELEGRAM_BOT_TOKEN", "test-token")
 os.environ.setdefault("TELEGRAM_CHAT_ID", "111")
 import unittest
