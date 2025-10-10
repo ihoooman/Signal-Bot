@@ -1274,29 +1274,47 @@ def process_updates(duration_seconds: float | None = None, poll_timeout: float =
             offset = max_update_id + 1
             offset_changed = True
 
-    if duration_seconds and duration_seconds > 0:
-        deadline = time.monotonic() + duration_seconds
-        while True:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                break
-            timeout = min(poll_timeout, remaining)
-            if timeout <= 0:
-                timeout = 0
-            handle_batch(_fetch_updates(offset, timeout))
-            if remaining <= 0:
-                break
-    else:
-        handle_batch(_fetch_updates(offset, 0))
+    def flush_changes() -> None:
+        nonlocal state_changed, subs_changed, offset_changed
+        if not (state_changed or subs_changed or offset_changed):
+            return
 
-    if offset_changed:
-        offd["offset"] = offset
-        save_json(OFFSET_FILE, offd)
-    if state_changed:
-        save_state(state)
-    if subs_changed or offset_changed:
-        total = count_subscribers(path=SUBS_FILE)
-        print(f"Updated subscribers: {total}, offset: {offd.get('offset', offset)}")
+        offset_was_updated = offset_changed
+        if offset_changed:
+            offd["offset"] = offset
+            save_json(OFFSET_FILE, offd)
+            offset_changed = False
+        if state_changed:
+            save_state(state)
+            state_changed = False
+        if subs_changed or offset_was_updated:
+            total = count_subscribers(path=SUBS_FILE)
+            print(f"Updated subscribers: {total}, offset: {offd.get('offset', offset)}")
+            subs_changed = False
+
+    try:
+        if duration_seconds is None:
+            poll_timeout_value = max(0.0, poll_timeout)
+            while True:
+                handle_batch(_fetch_updates(offset, poll_timeout_value))
+                flush_changes()
+        elif duration_seconds > 0:
+            deadline = time.monotonic() + duration_seconds
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                timeout = min(poll_timeout, remaining)
+                if timeout <= 0:
+                    timeout = 0
+                handle_batch(_fetch_updates(offset, timeout))
+                flush_changes()
+                if remaining <= 0:
+                    break
+        else:
+            handle_batch(_fetch_updates(offset, 0))
+    finally:
+        flush_changes()
 
 
 def main():  # pragma: no cover - retained for manual execution
