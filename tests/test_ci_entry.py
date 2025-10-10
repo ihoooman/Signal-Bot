@@ -2,6 +2,7 @@ import os
 import unittest
 from unittest import mock
 
+os.environ.setdefault("BOT_TOKEN", "test-token")
 os.environ.setdefault("TELEGRAM_BOT_TOKEN", "test-token")
 
 from trigger_xrp_bot import generate_snapshot_payload  # noqa: E402

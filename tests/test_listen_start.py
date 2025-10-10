@@ -7,6 +7,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+os.environ.setdefault("BOT_TOKEN", "test-token")
 os.environ.setdefault("TELEGRAM_BOT_TOKEN", "test-token")
 
 sys.path.append(str(Path(__file__).resolve().parents[1]))

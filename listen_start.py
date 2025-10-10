@@ -45,10 +45,36 @@ for candidate in (os.getenv("ENV_FILE"), REPO_ROOT / ".env", Path("~/xrpbot/.env
         load_dotenv(candidate_path)
         break
 
-TOKEN = os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("BOT_TOKEN")
-if not TOKEN:
-    raise RuntimeError("TELEGRAM_BOT_TOKEN is required to read Telegram updates")
-API   = f"https://api.telegram.org/bot{TOKEN}"
+_BOT_TOKEN_CACHE: str | None = None
+_API_BASE: str | None = None
+
+
+def _require_bot_token(*, force_refresh: bool = False) -> str:
+    global _BOT_TOKEN_CACHE
+    if force_refresh:
+        _BOT_TOKEN_CACHE = None
+    if _BOT_TOKEN_CACHE:
+        return _BOT_TOKEN_CACHE
+    token = os.getenv("BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN")
+    if not token:
+        raise RuntimeError("BOT_TOKEN is required to read Telegram updates")
+    _BOT_TOKEN_CACHE = token
+    return token
+
+
+def _get_api_base(*, force_refresh: bool = False) -> str:
+    global _API_BASE
+    if force_refresh:
+        _API_BASE = None
+    if _API_BASE:
+        return _API_BASE
+    _API_BASE = f"https://api.telegram.org/bot{_require_bot_token()}"
+    return _API_BASE
+
+
+def _api_url(method: str) -> str:
+    return f"{_get_api_base()}/{method}"
+
 
 BROADCAST_SLEEP_MS = int(os.getenv("BROADCAST_SLEEP_MS", "0"))
 
@@ -81,10 +107,27 @@ class _RequestsBot:
         return [_RequestsUpdate(item) for item in payload]
 
 
-if TelegramBot is not None:
-    BOT = TelegramBot(TOKEN)
-else:  # pragma: no cover - fallback when dependency missing
-    BOT = _RequestsBot(TOKEN)
+class _DeferredBot:
+    def __init__(self):
+        self._bot = None
+
+    def _ensure(self):
+        if self._bot is None:
+            token = _require_bot_token()
+            if TelegramBot is not None:
+                self._bot = TelegramBot(token)
+            else:  # pragma: no cover - fallback when dependency missing
+                self._bot = _RequestsBot(token)
+        return self._bot
+
+    def get_updates(self, *args, **kwargs):
+        return self._ensure().get_updates(*args, **kwargs)
+
+    def reset(self):  # pragma: no cover - convenience for tests
+        self._bot = None
+
+
+BOT = _DeferredBot()
 
 ROOT = Path(__file__).resolve().parent
 SUBS_FILE = Path(os.getenv("SUBSCRIBERS_DB_PATH") or os.getenv("SUBSCRIBERS_PATH", str(ROOT / "subscribers.sqlite3"))
@@ -386,7 +429,7 @@ def _send_stars_invoice(state: dict, chat_id: int | str, amount: int) -> bool:
     }
 
     try:
-        response = requests.post(f"{API}/sendInvoice", json=invoice, timeout=20)
+        response = requests.post(_api_url("sendInvoice"), json=invoice, timeout=20)
         response.raise_for_status()
     except requests.HTTPError as exc:
         _handle_invoice_error(chat_id, exc)
@@ -429,7 +472,7 @@ def handle_donate_stars_start(state: dict, chat_id: int | str) -> bool:
     }
 
     try:
-        response = requests.post(f"{API}/sendMessage", json=payload, timeout=20)
+        response = requests.post(_api_url("sendMessage"), json=payload, timeout=20)
         response.raise_for_status()
     except Exception as exc:  # pragma: no cover - network failure
         print(f"Failed to send donation options to {chat_id}: {exc}")
@@ -479,7 +522,7 @@ def handle_donate_custom_text(state: dict, chat_id: int | str, raw_text: str) ->
 def handle_pre_checkout_query(query: dict) -> None:
     payload = {"pre_checkout_query_id": query.get("id"), "ok": True}
     try:
-        response = requests.post(f"{API}/answerPreCheckoutQuery", json=payload, timeout=20)
+        response = requests.post(_api_url("answerPreCheckoutQuery"), json=payload, timeout=20)
         response.raise_for_status()
     except Exception as exc:  # pragma: no cover - best effort acknowledgement
         print(f"Failed to answer pre-checkout query {query.get('id')}: {exc}")
@@ -574,7 +617,7 @@ def handle_refund_request(chat_id: int | str, raw_text: str) -> None:
     charge_id = parts[1].strip()
     payload = {"user_id": chat_id, "telegram_payment_charge_id": charge_id}
     try:
-        response = requests.post(f"{API}/refundStarPayment", json=payload, timeout=20)
+        response = requests.post(_api_url("refundStarPayment"), json=payload, timeout=20)
         response.raise_for_status()
     except Exception as exc:  # pragma: no cover - network failure
         print(f"Refund request failed for {chat_id}: {exc}")
@@ -610,7 +653,7 @@ def send_start_prompt(chat_id: int | str, already_registered: bool = False) -> N
         "one_time_keyboard": True,
     }
     payload = {"chat_id": chat_id, "text": text, "reply_markup": keyboard}
-    resp = requests.post(f"{API}/sendMessage", json=payload, timeout=20)
+    resp = requests.post(_api_url("sendMessage"), json=payload, timeout=20)
     resp.raise_for_status()
 
 
@@ -624,7 +667,7 @@ def send_contact_confirmation(chat_id: int | str) -> None:
         "text": text,
         "reply_markup": {"remove_keyboard": True},
     }
-    resp = requests.post(f"{API}/sendMessage", json=payload, timeout=20)
+    resp = requests.post(_api_url("sendMessage"), json=payload, timeout=20)
     resp.raise_for_status()
 
 
@@ -649,7 +692,7 @@ def send_menu(chat_id: int | str, *, prepend_text: str | None = None) -> None:
         "text": "\n".join(line for line in lines if line is not None),
         "reply_markup": MENU_MARKUP,
     }
-    resp = requests.post(f"{API}/sendMessage", json=payload, timeout=20)
+    resp = requests.post(_api_url("sendMessage"), json=payload, timeout=20)
     resp.raise_for_status()
 
 
@@ -658,7 +701,7 @@ def send_unsubscribe_confirmation(chat_id: int | str) -> None:
         "اشتراک شما غیرفعال شد. برای فعال‌سازی دوباره، هر زمان /start را بفرستید و شماره خود را ارسال کنید."
     )
     payload = {"chat_id": chat_id, "text": text, "reply_markup": {"remove_keyboard": True}}
-    resp = requests.post(f"{API}/sendMessage", json=payload, timeout=20)
+    resp = requests.post(_api_url("sendMessage"), json=payload, timeout=20)
     resp.raise_for_status()
 
 
@@ -666,7 +709,7 @@ def answer_callback(callback_id: str, *, text: str | None = None) -> None:
     payload = {"callback_query_id": callback_id}
     if text:
         payload["text"] = text
-    resp = requests.post(f"{API}/answerCallbackQuery", json=payload, timeout=20)
+    resp = requests.post(_api_url("answerCallbackQuery"), json=payload, timeout=20)
     resp.raise_for_status()
 
 
@@ -733,7 +776,7 @@ def _send_ambiguous_options(chat_id: int | str, candidates: list[ResolutionCandi
         "text": "چند گزینه مشابه یافت شد، لطفاً انتخاب کنید:",
         "reply_markup": keyboard,
     }
-    resp = requests.post(f"{API}/sendMessage", json=payload, timeout=20)
+    resp = requests.post(_api_url("sendMessage"), json=payload, timeout=20)
     resp.raise_for_status()
 
 
@@ -803,7 +846,7 @@ def _send_remove_page(chat_id: int | str, pairs: list[str], page: int) -> None:
         + (f"\nصفحه {page_index + 1} از {total_pages}" if total_pages > 1 else ""),
         "reply_markup": {"inline_keyboard": keyboard},
     }
-    resp = requests.post(f"{API}/sendMessage", json=payload, timeout=20)
+    resp = requests.post(_api_url("sendMessage"), json=payload, timeout=20)
     resp.raise_for_status()
 
 
@@ -861,7 +904,7 @@ def _send_remove_confirm(chat_id: int | str, pair: str) -> None:
         "text": f"{pair}\nحذف شود؟ / Remove?",
         "reply_markup": keyboard,
     }
-    resp = requests.post(f"{API}/sendMessage", json=payload, timeout=20)
+    resp = requests.post(_api_url("sendMessage"), json=payload, timeout=20)
     resp.raise_for_status()
 
 
