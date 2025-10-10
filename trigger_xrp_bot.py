@@ -1,16 +1,39 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+import argparse
 import json
+import logging
 import os, requests, numpy as np, pandas as pd
+import sys
+import time
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
 from pathlib import Path
+from typing import Dict, Iterable, Sequence
+
+SRC_DIR = Path(__file__).resolve().parent / "src"
+if SRC_DIR.exists():
+    sys.path.insert(0, str(SRC_DIR))
+
+from signal_bot.services.instruments import (
+    get_default_pairs,
+    get_instrument_by_pair,
+)
+
+from subscriptions import get_user_watchlist, load_subscribers
 
 # در اکشن‌های گیت‌هاب، مسیر خانگی شما وجود ندارد؛ پس مسیر نسبی به خود فایل را پیش‌فرض می‌گیریم
-_DEFAULT_SUBS = os.path.join(os.path.dirname(__file__), "subscribers.json")
-_ALT_SUBS     = os.path.expanduser("~/xrpbot-1/subscribers.json")
-SUBSCRIBERS_PATH = os.getenv("SUBSCRIBERS_PATH", _DEFAULT_SUBS if os.path.exists(os.path.dirname(__file__)) else _ALT_SUBS)
+logging.basicConfig(level=logging.INFO)
+LOGGER = logging.getLogger(__name__)
+
+_DEFAULT_SUBS = os.path.join(os.path.dirname(__file__), "subscribers.sqlite3")
+_ALT_SUBS     = os.path.expanduser("~/xrpbot-1/subscribers.sqlite3")
+_SUBS_OVERRIDE = os.getenv("SUBSCRIBERS_DB_PATH") or os.getenv("SUBSCRIBERS_PATH")
+SUBSCRIBERS_PATH = _SUBS_OVERRIDE or (
+    _DEFAULT_SUBS if os.path.exists(os.path.dirname(__file__)) else _ALT_SUBS
+)
+_DEFAULT_EMERGENCY_STATE = Path(__file__).with_name("emergency_state.json")
 
 # ====== تنظیمات از .env ======
 _REPO_ROOT = Path(__file__).resolve().parent
@@ -27,48 +50,30 @@ for _candidate in _ENV_CANDIDATES:
     if _candidate_path.exists():
         load_dotenv(_candidate_path)
         break
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("BOT_TOKEN")
 TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID")
 CRYPTOCOMPARE_API_KEY = os.getenv("CRYPTOCOMPARE_API_KEY")
+BROADCAST_SLEEP_MS = int(os.getenv("BROADCAST_SLEEP_MS", "0"))
+_BACKOFF_SCHEDULE = (0.5, 1.0, 2.0)
 
 if not TELEGRAM_BOT_TOKEN:
     raise RuntimeError("TELEGRAM_BOT_TOKEN is required (set in .env or environment)")
 
 
-def load_subscribers(path: Path) -> list[str]:
-    """Load Telegram chat IDs from JSON list. Returns empty list if missing."""
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except FileNotFoundError:
-        return []
-    except Exception as exc:
-        raise RuntimeError(f"Failed to read subscribers file at {path}: {exc}") from exc
-
-    if not isinstance(data, list):
-        raise RuntimeError(f"Subscribers file {path} must contain a JSON list of chat IDs")
-
-    seen = set()
-    subscribers: list[str] = []
-    for entry in data:
-        chat_id = str(entry).strip()
-        if not chat_id:
+def resolve_chat_ids(subscribers: list[dict[str, str]], fallback_chat_id: str | None) -> list[str]:
+    chat_ids = []
+    for sub in subscribers:
+        if not sub.get("is_subscribed"):
             continue
-        if chat_id not in seen:
-            seen.add(chat_id)
-            subscribers.append(chat_id)
-    return subscribers
-
-
-def resolve_chat_ids(subscribers: list[str], fallback_chat_id: str | None) -> list[str]:
-    if subscribers:
-        return subscribers
+        chat_id = str(sub.get("chat_id") or "").strip()
+        if chat_id:
+            chat_ids.append(chat_id)
+    if chat_ids:
+        return chat_ids
     if fallback_chat_id:
         return [str(fallback_chat_id)]
     return []
 
-
-# اگر True فقط موقع سیگنال "خرید/فروش" پیام می‌دهد (وگرنه همیشه گزارش می‌دهد)
-SEND_ONLY_ON_TRIGGER = True
 
 # ===== Thresholds (قابل تغییر) =====
 BUY_RSI_D_MIN   = 55   # Daily RSI برای خرید
@@ -87,14 +92,32 @@ PROFIT_THRESHOLD     = 0.01  # 1% به عنوان برد برای Buy (و -1% ب
 NEAR_PCT             = 0.01  # 1% نزدیکی ساپورت/مقاومت
 
 # دارایی‌ها: XRP + BTC + ETH + SOL
-SYMBOLS = [
-    ("XRP", "XRP"),
-    ("BTC", "BTC"),
-    ("ETH", "ETH"),
-    ("SOL", "SOL"),
-]
+DEFAULT_PAIRS = tuple(pair.upper() for pair in get_default_pairs())
 
 CRYPTOCOMPARE_BASE = "https://min-api.cryptocompare.com/data/v2"
+SOURCES_LINE = "Sources: TradingView (USD pairs), CryptoCompare, CoinMarketCap"
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Crypto signal broadcaster")
+    parser.add_argument(
+        "--mode",
+        choices=["summary", "emergency"],
+        default="summary",
+        help=(
+            "Select broadcast mode: 'summary' pushes the scheduled 4-hour overview, "
+            "'emergency' only sends when BUY/SELL triggers are active during the 2-hour check."
+        ),
+    )
+    parser.add_argument(
+        "--emergency-state-path",
+        default=None,
+        help=(
+            "Path to persist emergency signal state. Required to suppress duplicate alerts when "
+            "running the 2-hour job. Defaults to 'emergency_state.json' next to this file."
+        ),
+    )
+    return parser.parse_args()
 
 # ===================== ابزار داده و اندیکاتورها =====================
 
@@ -250,34 +273,71 @@ def historical_flags_4h(close_h: pd.Series, rsi_h: pd.Series, hist_h: pd.Series,
 # ===================== پیام و ابزار =====================
 
 def tehran_now():
-    return datetime.now(ZoneInfo("Asia/Tehran")).strftime("%Y-%m-%d %H:%M:%S")
+    tz_name = os.getenv("TIMEZONE", "Asia/Tehran")
+    try:
+        tz = ZoneInfo(tz_name)
+    except Exception:  # pragma: no cover - fallback to default
+        tz = ZoneInfo("Asia/Tehran")
+    return datetime.now(tz).strftime("%Y-%m-%d %H:%M:%S")
 
 def send_telegram(chat_id: str, text: str):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {"chat_id": chat_id, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True}
-    resp = requests.post(url, json=payload, timeout=20)
-    if resp.status_code >= 400:
-        raise RuntimeError(f"Telegram API error for chat {chat_id}: {resp.status_code} {resp.text}")
+
+    for attempt, backoff in enumerate(_BACKOFF_SCHEDULE, start=1):
+        resp = requests.post(url, json=payload, timeout=20)
+        if resp.status_code in (420, 429):
+            LOGGER.warning(
+                "Telegram rate limit hit (status=%s) for chat %s, retry %s/%s in %.1fs",
+                resp.status_code,
+                chat_id,
+                attempt,
+                len(_BACKOFF_SCHEDULE),
+                backoff,
+            )
+            time.sleep(backoff)
+            continue
+        if resp.status_code >= 400:
+            raise RuntimeError(
+                f"Telegram API error for chat {chat_id}: {resp.status_code} {resp.text}"
+            )
+        return
+
+    raise RuntimeError(f"Telegram API rate limited for chat {chat_id} after retries")
 
 
-def broadcast(text: str, chat_ids: list[str]):
+def broadcast(text: str, chat_ids: list[str], *, job: str, events: list[dict[str, object]]):
     errors: list[str] = []
-    for chat_id in chat_ids:
+    started = time.monotonic()
+    for index, chat_id in enumerate(chat_ids):
         try:
             send_telegram(chat_id, text)
         except Exception as exc:
             errors.append(f"{chat_id}: {exc}")
+        else:
+            if BROADCAST_SLEEP_MS > 0 and index < len(chat_ids) - 1:
+                time.sleep(BROADCAST_SLEEP_MS / 1000.0)
+    duration_ms = (time.monotonic() - started) * 1000
+    for event in events:
+        LOGGER.info(
+            "broadcast job=%s pair=%s event_fp=%s chat_count=%s duration_ms=%.0f",
+            job,
+            event.get("pair") or event.get("name", ""),
+            _result_key(event),
+            len(chat_ids),
+            duration_ms,
+        )
     if errors:
         raise RuntimeError("Failed to send to some chats: " + ", ".join(errors))
 
-def build_message_block(symbol_name, signal_type, timeframe, ctx, prob=None, avg_ret=None, horizon_label=""):
+def build_message_block(symbol_name, symbol_pair, signal_type, timeframe, ctx, prob=None, avg_ret=None, horizon_label=""):
     dt = tehran_now()
     if signal_type == "BUY":
-        head = f"<b>{symbol_name}</b> — <b>BUY SIGNAL ✅</b>  |  <b>{timeframe}</b>  |  {dt}"
+        head = f"<b>{symbol_pair}</b> ({symbol_name}) — <b>BUY SIGNAL ✅</b>  |  <b>{timeframe}</b>  |  {dt}"
     elif signal_type == "SELL":
-        head = f"<b>{symbol_name}</b> — <b>SELL SIGNAL ⛔️</b>  |  <b>{timeframe}</b>  |  {dt}"
+        head = f"<b>{symbol_pair}</b> ({symbol_name}) — <b>SELL SIGNAL ⛔️</b>  |  <b>{timeframe}</b>  |  {dt}"
     else:
-        head = f"<b>{symbol_name}</b> — <b>No signal ❌</b>  |  {dt}"
+        head = f"<b>{symbol_pair}</b> ({symbol_name}) — <b>No signal ❌</b>  |  {dt}"
 
     lines = [
         head,
@@ -297,6 +357,64 @@ def build_message_block(symbol_name, signal_type, timeframe, ctx, prob=None, avg
         lines.append("Context: " + ", ".join(extra))
 
     return "\n".join(lines)
+
+
+def format_summary_report(results: list[dict[str, object]]) -> str:
+    dt = tehran_now()
+    sections: list[str] = [f"<b>📊 SUMMARY REPORT (4h)</b> — {dt}", ""]
+
+    groups = {"BUY": [], "SELL": [], "NO ACTION": []}
+    errors: list[str] = []
+    for res in results:
+        signal = res.get("signal")
+        text = res.get("text", "")
+        if signal in ("BUY", "SELL"):
+            groups[signal].append(text)
+        elif signal == "ERROR":
+            errors.append(text)
+        else:
+            groups["NO ACTION"].append(text)
+
+    titles = [
+        ("BUY", "✅ <b>BUY</b>"),
+        ("SELL", "⛔️ <b>SELL</b>"),
+        ("NO ACTION", "⚪️ <b>NO ACTION</b>"),
+    ]
+    for key, title in titles:
+        sections.append(title)
+        if groups[key]:
+            sections.append("\n\n".join(str(entry) for entry in groups[key]))
+        else:
+            sections.append("هیچ موردی ثبت نشد.")
+        sections.append("")
+
+    if errors:
+        sections.append("⚠️ <b>Errors</b>")
+        sections.append("\n\n".join(errors))
+        sections.append("")
+
+    sections.append(SOURCES_LINE)
+    return "\n".join(part for part in sections if part)
+
+
+def format_emergency_report(results: list[dict[str, object]]) -> str | None:
+    signals = [str(res.get("text", "")) for res in results if res.get("signal") in ("BUY", "SELL")]
+    if not signals:
+        return None
+
+    errors = [str(res.get("text", "")) for res in results if res.get("signal") == "ERROR"]
+    dt = tehran_now()
+    parts = [
+        f"<b>🚨 EMERGENCY SIGNAL</b> — {dt}",
+        "چک دو ساعته: سیگنال جدید شناسایی شد.",
+        "",
+        "\n\n".join(signals),
+        "",
+    ]
+    if errors:
+        parts.extend(["⚠️ <b>Errors</b>", "\n\n".join(errors), ""])
+    parts.append(SOURCES_LINE)
+    return "\n".join(part for part in parts if part)
 
 # ===================== منطق هر نماد =====================
 
@@ -393,34 +511,310 @@ def evaluate_symbol(symbol: str, name: str):
 
 # ===================== اجرای اصلی =====================
 
-def main():
+def _load_emergency_state(path: Path) -> dict:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {"active_signals": []}
+    except Exception:
+        return {"active_signals": []}
+
+
+def _save_emergency_state(path: Path, state: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(state, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
+
+
+def _result_key(res: dict[str, object]) -> str:
+    pair = str(res.get("pair") or res.get("name") or "")
+    return f"{pair}::{res.get('signal','')}::{res.get('timeframe','')}"
+
+
+def _default_pair_set() -> set[str]:
+    return set(DEFAULT_PAIRS)
+
+
+def _normalise_pair(pair: str) -> str | None:
+    inst = get_instrument_by_pair(pair)
+    return inst.pair if inst else None
+
+
+def _pairs_for_user(chat_id: str, subs_path: Path) -> set[str]:
+    pairs = set(_default_pair_set())
+    for raw_pair in get_user_watchlist(chat_id, path=subs_path):
+        normalised = _normalise_pair(raw_pair)
+        if not normalised:
+            LOGGER.warning("Skipping unsupported watchlist pair %s for chat %s", raw_pair, chat_id)
+            continue
+        pairs.add(normalised)
+    return pairs
+
+
+def _collect_user_targets(
+    subscribers: Sequence[dict[str, object]],
+    subs_path: Path,
+    *,
+    fallback_chat_id: str | None,
+    target_chat_ids: Sequence[str] | None = None,
+) -> Dict[str, set[str]]:
+    allowed = {str(chat_id) for chat_id in target_chat_ids} if target_chat_ids else None
+    mapping: Dict[str, set[str]] = {}
+
+    for sub in subscribers:
+        if not sub.get("is_subscribed"):
+            continue
+        chat_id = str(sub.get("chat_id") or "").strip()
+        if not chat_id:
+            continue
+        if allowed and chat_id not in allowed:
+            continue
+        mapping[chat_id] = _pairs_for_user(chat_id, subs_path)
+
+    if allowed:
+        for chat_id in allowed:
+            mapping.setdefault(chat_id, set(_default_pair_set()))
+
+    if not mapping and fallback_chat_id and (allowed is None or fallback_chat_id in allowed):
+        mapping[str(fallback_chat_id)] = set(_default_pair_set())
+
+    return mapping
+
+
+def _evaluate_pair(pair: str) -> dict[str, object]:
+    inst = get_instrument_by_pair(pair)
+    if not inst:
+        raise ValueError(f"Unsupported instrument pair: {pair}")
+    try:
+        name, sig, tf, ctx, prob, avg_ret, hz = evaluate_symbol(inst.symbol, inst.display_name)
+        block = build_message_block(inst.display_name, inst.pair, sig, tf, ctx, prob, avg_ret, hz)
+        signal_value = sig if sig in ("BUY", "SELL") else "NO ACTION"
+        return {
+            "pair": inst.pair,
+            "name": inst.display_name,
+            "signal": signal_value,
+            "timeframe": tf,
+            "ctx": ctx,
+            "prob": prob,
+            "avg_ret": avg_ret,
+            "horizon": hz,
+            "text": block,
+        }
+    except Exception as exc:
+        return {
+            "pair": inst.pair,
+            "name": inst.display_name,
+            "signal": "ERROR",
+            "timeframe": "",
+            "ctx": {},
+            "prob": None,
+            "avg_ret": None,
+            "horizon": "",
+            "text": f"<b>{inst.display_name}</b> ({inst.pair}) — error: {exc}",
+        }
+
+
+def _evaluate_pairs(pairs: Iterable[str]) -> Dict[str, dict[str, object]]:
+    results: Dict[str, dict[str, object]] = {}
+    for pair in pairs:
+        normalised = _normalise_pair(pair)
+        if not normalised:
+            LOGGER.warning("Skipping unsupported pair evaluation request: %s", pair)
+            continue
+        results[normalised] = _evaluate_pair(normalised)
+    return results
+
+
+def format_compact_summary(results: list[dict[str, object]]) -> str:
+    dt = tehran_now()
+    lines = [f"<b>📬 On-demand update</b> — {dt}", ""]
+    groups = {"BUY": [], "SELL": [], "NO ACTION": []}
+    errors: list[str] = []
+    for res in results:
+        signal = res.get("signal")
+        pair = res.get("pair")
+        if signal in groups:
+            groups[signal].append(f"<b>{pair}</b>")
+        elif signal == "ERROR":
+            errors.append(str(res.get("text", "")))
+        else:
+            groups["NO ACTION"].append(f"<b>{pair}</b>")
+
+    for key, title in (("BUY", "✅ BUY"), ("SELL", "⛔️ SELL"), ("NO ACTION", "⚪️ NO ACTION")):
+        values = groups[key]
+        if values:
+            lines.append(f"{title}: " + ", ".join(values))
+        else:
+            lines.append(f"{title}: —")
+    if errors:
+        lines.append("")
+        lines.append("⚠️ Errors")
+        lines.append("\n\n".join(errors))
+    lines.append("")
+    lines.append(SOURCES_LINE)
+    return "\n".join(part for part in lines if part)
+
+
+def generate_on_demand_update(
+    chat_id: str,
+    *,
+    emergency_state_path: Path | None = None,
+) -> tuple[list[str], list[dict[str, object]]]:
     subs_path = Path(SUBSCRIBERS_PATH).expanduser()
     subscribers = load_subscribers(subs_path)
-    chat_ids = resolve_chat_ids(subscribers, TELEGRAM_CHAT_ID)
-    if not chat_ids:
+    targets = _collect_user_targets(
+        subscribers,
+        subs_path,
+        fallback_chat_id=str(TELEGRAM_CHAT_ID) if TELEGRAM_CHAT_ID else None,
+        target_chat_ids=[chat_id],
+    )
+    pairs = targets.get(str(chat_id), set(_default_pair_set()))
+    results_by_pair = _evaluate_pairs(sorted(pairs))
+    results = [results_by_pair[pair] for pair in sorted(results_by_pair)]
+
+    summary_text = format_compact_summary(results)
+    messages = [summary_text]
+
+    state_path = Path(emergency_state_path).expanduser() if emergency_state_path else _DEFAULT_EMERGENCY_STATE
+    state = _load_emergency_state(state_path)
+    previous = set(state.get("active_signals", []))
+    results_by_key = {_result_key(res): res for res in results}
+    current = {key for key, res in results_by_key.items() if res.get("signal") in ("BUY", "SELL")}
+    new_keys = current - previous
+    if new_keys:
+        emergencies = [results_by_key[key] for key in new_keys]
+        emergency_text = format_emergency_report(emergencies)
+        if emergency_text:
+            messages.append(emergency_text)
+
+    return messages, results
+
+
+def generate_snapshot_payload() -> dict:
+    subs_path = Path(SUBSCRIBERS_PATH).expanduser()
+    subscribers = load_subscribers(subs_path)
+    targets = _collect_user_targets(
+        subscribers,
+        subs_path,
+        fallback_chat_id=str(TELEGRAM_CHAT_ID) if TELEGRAM_CHAT_ID else None,
+        target_chat_ids=None,
+    )
+
+    if targets:
+        required_pairs = sorted({pair for pairs in targets.values() for pair in pairs})
+    else:
+        required_pairs = sorted(_default_pair_set())
+
+    results_by_pair = _evaluate_pairs(required_pairs)
+    counts = {"BUY": 0, "SELL": 0, "NO_ACTION": 0}
+    emergencies = 0
+    highlights: list[dict[str, str]] = []
+
+    for pair in sorted(results_by_pair):
+        result = results_by_pair[pair]
+        signal = str(result.get("signal") or "NO ACTION")
+        text = str(result.get("text") or "")
+        canonical_pair = result.get("pair") or pair
+
+        if signal in ("BUY", "SELL"):
+            counts[signal] += 1
+            emergencies += 1
+        elif signal == "ERROR":
+            counts.setdefault("ERROR", 0)
+            counts["ERROR"] += 1
+        else:
+            counts["NO_ACTION"] += 1
+
+        highlights.append({"symbol": str(canonical_pair), "line": text})
+
+    counts["emergencies_last_4h"] = emergencies
+
+    default_pairs = set(_default_pair_set())
+    per_user_overrides = any(set(pairs) != default_pairs for pairs in targets.values())
+
+    snapshot = {
+        "generated_at": tehran_now(),
+        "counts": counts,
+        "highlights": highlights,
+        "per_user_overrides": bool(per_user_overrides),
+    }
+    return snapshot
+
+
+def run(
+    mode: str,
+    *,
+    emergency_state_path: Path | None = None,
+    target_chat_ids: Sequence[str] | None = None,
+    persist_state: bool = True,
+) -> bool:
+    subs_path = Path(SUBSCRIBERS_PATH).expanduser()
+    subscribers = load_subscribers(subs_path)
+    targets = _collect_user_targets(
+        subscribers,
+        subs_path,
+        fallback_chat_id=str(TELEGRAM_CHAT_ID) if TELEGRAM_CHAT_ID else None,
+        target_chat_ids=target_chat_ids,
+    )
+
+    if not targets:
         raise RuntimeError(
             "No Telegram chat IDs configured. Set TELEGRAM_CHAT_ID or add IDs to subscribers.json"
         )
 
-    blocks = []
-    any_signal = False
+    required_pairs = sorted({pair for pairs in targets.values() for pair in pairs})
+    results_by_pair = _evaluate_pairs(required_pairs)
+    all_results = list(results_by_pair.values())
 
-    for sym, name in SYMBOLS:
-        try:
-            name, sig, tf, ctx, prob, avg_ret, hz = evaluate_symbol(sym, name)
-            if sig in ("BUY", "SELL"): any_signal = True
-            block = build_message_block(name, sig, tf, ctx, prob, avg_ret, hz)
-            blocks.append(block)
-        except Exception as e:
-            blocks.append(f"<b>{name}</b> — error: {e}")
+    if mode == "emergency":
+        state_path = emergency_state_path or _DEFAULT_EMERGENCY_STATE
+        state = _load_emergency_state(state_path)
+        previous = set(state.get("active_signals", []))
+        results_by_key = {_result_key(res): res for res in all_results}
+        current = {
+            key for key, res in results_by_key.items() if res.get("signal") in ("BUY", "SELL")
+        }
+        new_keys = current - previous
 
-    text = "\n\n".join(blocks) + "\n\nSources: TradingView (USD pairs), CryptoCompare, CoinMarketCap"
+        if persist_state:
+            state.update(
+                {
+                    "active_signals": sorted(current),
+                    "updated_at": tehran_now(),
+                }
+            )
+            _save_emergency_state(state_path, state)
 
-    if SEND_ONLY_ON_TRIGGER:
-        if any_signal:
-            broadcast(text, chat_ids)
-    else:
-        broadcast(text, chat_ids)
+        if not new_keys:
+            return False
+
+        messages_sent = False
+        for chat_id, pairs in targets.items():
+            user_results = [results_by_pair[pair] for pair in sorted(pairs) if pair in results_by_pair]
+            filtered = [res for res in user_results if _result_key(res) in new_keys]
+            if not filtered:
+                continue
+            message = format_emergency_report(filtered)
+            if not message:
+                continue
+            broadcast(message, [chat_id], job=mode, events=filtered)
+            messages_sent = True
+        return messages_sent
+
+    messages_sent = False
+    for chat_id, pairs in targets.items():
+        user_results = [results_by_pair[pair] for pair in sorted(pairs) if pair in results_by_pair]
+        if not user_results:
+            continue
+        message = format_summary_report(user_results)
+        broadcast(message, [chat_id], job=mode, events=user_results)
+        messages_sent = True
+    return messages_sent
+
+
+def main():
+    args = parse_args()
+    state_path = Path(args.emergency_state_path).expanduser() if args.emergency_state_path else None
+    run(args.mode, emergency_state_path=state_path)
 
 if __name__ == "__main__":
     main()

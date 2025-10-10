@@ -16,6 +16,7 @@ pyvenv.cfg
 .env.*
 !.env.example
 subscribers.json
+subscribers.sqlite3
 offset.json
 *.log
 
