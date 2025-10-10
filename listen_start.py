@@ -3,6 +3,7 @@
 import asyncio
 import inspect
 import os, json, math, re, requests, sys, time, uuid
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from dotenv import load_dotenv
 try:
@@ -91,7 +92,8 @@ else:  # pragma: no cover - fallback when dependency missing
 ROOT = Path(__file__).resolve().parent
 SUBS_FILE = Path(os.getenv("SUBSCRIBERS_DB_PATH") or os.getenv("SUBSCRIBERS_PATH", str(ROOT / "subscribers.sqlite3"))
     ).expanduser()
-OFFSET_FILE = Path(os.getenv("OFFSET_FILE", str(ROOT / "offset.json"))).expanduser()
+OFFSET_FILE = Path(os.getenv("OFFSET_FILE", str(ROOT / "data" / "offset.txt"))).expanduser()
+LEGACY_OFFSET_FILE = Path(os.getenv("LEGACY_OFFSET_FILE", str(ROOT / "offset.json"))).expanduser()
 STATE_FILE = Path(os.getenv("CONVERSATION_STATE_PATH", str(ROOT / "conversation_state.json"))).expanduser()
 SNAPSHOT_PATH = Path(os.getenv("SNAPSHOT_PATH", str(ROOT / "data" / "last_summary.json"))).expanduser()
 
@@ -206,6 +208,68 @@ MENU_MARKUP = {
 }
 
 REMOVE_PAGE_SIZE = 10
+CONTACT_PROMPT_INTERVAL = timedelta(minutes=10)
+CONTACT_PENDING_MESSAGE = (
+    "شماره شما هنوز تأیید نشده است. لطفاً دکمه «📱 ارسال شماره من» را بزنید یا دوباره /start را ارسال کنید."
+)
+
+
+def _parse_contact_timestamp(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+def ensure_contact_prompt(existing: dict | None, chat_id: int | str) -> tuple[bool, bool]:
+    if existing and existing.get("phone_number"):
+        return False, False
+
+    now = datetime.now(timezone.utc)
+    awaiting = bool(existing.get("awaiting_contact")) if isinstance(existing, dict) else False
+    prompted_at = (
+        _parse_contact_timestamp(existing.get("contact_prompted_at"))
+        if isinstance(existing, dict)
+        else None
+    )
+    should_send_keyboard = (
+        not awaiting
+        or prompted_at is None
+        or now - prompted_at >= CONTACT_PROMPT_INTERVAL
+    )
+    record_changed = False
+
+    if should_send_keyboard:
+        try:
+            send_start_prompt(chat_id, already_registered=False)
+        except Exception as exc:  # pragma: no cover - network failure
+            print(f"Failed to send contact prompt to {chat_id}: {exc}")
+        try:
+            record_changed, _ = upsert_subscriber(
+                chat_id,
+                phone_number=existing.get("phone_number") if isinstance(existing, dict) else None,
+                first_name=existing.get("first_name") if isinstance(existing, dict) else None,
+                last_name=existing.get("last_name") if isinstance(existing, dict) else None,
+                username=existing.get("username") if isinstance(existing, dict) else None,
+                is_subscribed=bool(existing.get("is_subscribed")) if isinstance(existing, dict) else False,
+                awaiting_contact=True,
+                contact_prompted_at=now,
+                path=SUBS_FILE,
+            )
+        except Exception as exc:  # pragma: no cover - db failure
+            print(f"Failed to record contact prompt state for {chat_id}: {exc}")
+    else:
+        try:
+            send_telegram(str(chat_id), CONTACT_PENDING_MESSAGE)
+        except Exception as exc:  # pragma: no cover - network failure
+            print(f"Failed to send awaiting-contact notice to {chat_id}: {exc}")
+
+    return True, record_changed
 
 def load_json(path, default):
     try:
@@ -217,6 +281,36 @@ def load_json(path, default):
 def save_json(path, obj):
     with open(path, "w") as f:
         json.dump(obj, f, ensure_ascii=False)
+
+
+def load_offset(path: Path, *, legacy_path: Path | None = None) -> int:
+    candidate = Path(path)
+    try:
+        with open(candidate, "r", encoding="utf-8") as fh:
+            raw = fh.read().strip()
+    except FileNotFoundError:
+        if legacy_path:
+            legacy_data = load_json(legacy_path, {"offset": 0})
+            try:
+                return int(legacy_data.get("offset", 0))
+            except Exception:
+                return 0
+        return 0
+    except Exception:
+        return 0
+    if not raw:
+        return 0
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return 0
+
+
+def save_offset(path: Path, value: int) -> None:
+    candidate = Path(path)
+    candidate.parent.mkdir(parents=True, exist_ok=True)
+    with open(candidate, "w", encoding="utf-8") as fh:
+        fh.write(f"{max(0, int(value))}")
 
 
 def load_state() -> dict:
@@ -1014,265 +1108,329 @@ def _fetch_updates(offset: int, timeout: float) -> list[dict]:
 
 
 def process_updates(duration_seconds: float | None = None, poll_timeout: float = 10.0) -> None:
-    offd = load_json(OFFSET_FILE, {"offset": 0})
-    offset = int(offd.get("offset", 0))
+    legacy_candidate = (
+        LEGACY_OFFSET_FILE
+        if LEGACY_OFFSET_FILE != OFFSET_FILE and LEGACY_OFFSET_FILE.exists()
+        else None
+    )
+    offset = load_offset(OFFSET_FILE, legacy_path=legacy_candidate)
+    last_processed_update_id = offset - 1 if offset > 0 else None
 
     state = load_state()
     state_changed = False
     subs_changed = False
     offset_changed = False
-    max_update_id = offset
 
     def handle_batch(updates: list[dict]) -> None:
-        nonlocal max_update_id, state_changed, subs_changed, offset_changed, offset
+        nonlocal offset, state_changed, subs_changed, offset_changed, last_processed_update_id
         if not updates:
             return
 
-        previous_offset = offset
         for upd in updates:
-            max_update_id = max(max_update_id, upd.get("update_id", max_update_id))
-
-            pre_checkout = upd.get("pre_checkout_query")
-            if pre_checkout:
-                handle_pre_checkout_query(pre_checkout)
+            if not isinstance(upd, dict):
                 continue
+            update_id = upd.get("update_id")
+            if (
+                update_id is not None
+                and last_processed_update_id is not None
+                and update_id <= last_processed_update_id
+            ):
+                continue
+            try:
+                pre_checkout = upd.get("pre_checkout_query")
+                if pre_checkout:
+                    handle_pre_checkout_query(pre_checkout)
+                    continue
 
-            callback = upd.get("callback_query")
-            if callback:
-                callback_id = callback.get("id")
-                try:
-                    answer_callback(callback_id or "")
-                except Exception as exc:  # pragma: no cover
-                    print(f"Failed to answer callback {callback_id}: {exc}")
-                message = callback.get("message") or {}
-                chat = message.get("chat") or {}
+                callback = upd.get("callback_query")
+                if callback:
+                    callback_id = callback.get("id")
+                    try:
+                        answer_callback(callback_id or "")
+                    except Exception as exc:  # pragma: no cover
+                        print(f"Failed to answer callback {callback_id}: {exc}")
+                    message = callback.get("message") or {}
+                    chat = message.get("chat") or {}
+                    chat_id = chat.get("id")
+                    if not chat_id:
+                        continue
+                    data = (callback.get("data") or "").strip()
+                    existing = get_subscriber(chat_id, path=SUBS_FILE)
+                    requires_contact = data != "get_updates_now"
+                    if requires_contact:
+                        handled, changed = ensure_contact_prompt(existing, chat_id)
+                        subs_changed = subs_changed or changed
+                        if handled:
+                            continue
+                    if data == "get_updates_now":
+                        handle_get_updates_now(chat_id)
+                    elif data == "add_asset_start":
+                        state_changed = handle_add_asset_start(state, chat_id) or state_changed
+                    elif data == "remove_asset_start":
+                        state_changed = handle_remove_asset_start(state, chat_id) or state_changed
+                    elif data == "donate_stars_start":
+                        state_changed = handle_donate_stars_start(state, chat_id) or state_changed
+                    elif data.startswith("donate:tier:"):
+                        try:
+                            amount = int(data.split(":", 2)[2])
+                        except ValueError:
+                            amount = 0
+                        state_changed = handle_donate_tier(state, chat_id, amount) or state_changed
+                    elif data == "donate:custom":
+                        state_changed = handle_donate_custom_prompt(state, chat_id) or state_changed
+                    elif data.startswith("remove_asset:page:"):
+                        try:
+                            page = int(data.rsplit(":", 1)[1])
+                        except ValueError:
+                            page = 0
+                        state_changed = handle_remove_asset_page(state, chat_id, page) or state_changed
+                    elif data.startswith("remove_asset:pick:"):
+                        pair = data.split(":", 2)[2]
+                        state_changed = handle_remove_asset_pick(state, chat_id, pair) or state_changed
+                    elif data.startswith("remove_asset:confirm:"):
+                        parts = data.split(":")
+                        if len(parts) == 4:
+                            _, _, pair, decision = parts
+                            state_changed = (
+                                handle_remove_asset_confirm(state, chat_id, pair, decision)
+                                or state_changed
+                            )
+                    elif data.startswith("addasset:pick:"):
+                        pair = data.split(":", 2)[2]
+                        state_changed = handle_add_asset_pick(state, chat_id, pair) or state_changed
+                    else:
+                        try:
+                            send_telegram(str(chat_id), "دستور ناشناخته است.")
+                        except Exception as exc:  # pragma: no cover
+                            print(f"Failed to notify unknown callback for {chat_id}: {exc}")
+                    continue
+
+                msg = upd.get("message") or upd.get("channel_post")
+                if not msg:
+                    continue
+
+                chat = msg.get("chat", {}) or {}
                 chat_id = chat.get("id")
                 if not chat_id:
                     continue
-                data = (callback.get("data") or "").strip()
-                if data == "get_updates_now":
-                    handle_get_updates_now(chat_id)
-                elif data == "add_asset_start":
-                    state_changed = handle_add_asset_start(state, chat_id) or state_changed
-                elif data == "remove_asset_start":
-                    state_changed = handle_remove_asset_start(state, chat_id) or state_changed
-                elif data == "donate_stars_start":
-                    state_changed = handle_donate_stars_start(state, chat_id) or state_changed
-                elif data.startswith("donate:tier:"):
-                    try:
-                        amount = int(data.split(":", 2)[2])
-                    except ValueError:
-                        amount = 0
-                    state_changed = handle_donate_tier(state, chat_id, amount) or state_changed
-                elif data == "donate:custom":
-                    state_changed = handle_donate_custom_prompt(state, chat_id) or state_changed
-                elif data.startswith("remove_asset:page:"):
-                    try:
-                        page = int(data.rsplit(":", 1)[1])
-                    except ValueError:
-                        page = 0
-                    state_changed = handle_remove_asset_page(state, chat_id, page) or state_changed
-                elif data.startswith("remove_asset:pick:"):
-                    pair = data.split(":", 2)[2]
-                    state_changed = handle_remove_asset_pick(state, chat_id, pair) or state_changed
-                elif data.startswith("remove_asset:confirm:"):
-                    parts = data.split(":")
-                    if len(parts) == 4:
-                        _, _, pair, decision = parts
-                        state_changed = handle_remove_asset_confirm(
-                            state, chat_id, pair, decision
-                        ) or state_changed
-                elif data.startswith("addasset:pick:"):
-                    pair = data.split(":", 2)[2]
-                    state_changed = handle_add_asset_pick(state, chat_id, pair) or state_changed
-                else:
-                    try:
-                        send_telegram(str(chat_id), "دستور ناشناخته است.")
-                    except Exception as exc:  # pragma: no cover
-                        print(f"Failed to notify unknown callback for {chat_id}: {exc}")
-                continue
 
-            msg = upd.get("message") or upd.get("channel_post")
-            if not msg:
-                continue
+                existing = get_subscriber(chat_id, path=SUBS_FILE)
+                conversation = get_conversation(state, chat_id)
 
-            chat = msg.get("chat", {})
-            chat_id = chat.get("id")
-            if not chat_id:
-                continue
-
-            existing = get_subscriber(chat_id, path=SUBS_FILE)
-            conversation = get_conversation(state, chat_id)
-
-            payment = msg.get("successful_payment")
-            if payment:
-                state_changed = handle_successful_payment(state, chat_id, payment) or state_changed
-                continue
-
-            contact = msg.get("contact")
-            if contact:
-                contact_user_id = contact.get("user_id")
-                if contact_user_id and str(contact_user_id) != str(chat_id):
+                payment = msg.get("successful_payment")
+                if payment:
+                    state_changed = handle_successful_payment(state, chat_id, payment) or state_changed
                     continue
-                phone = contact.get("phone_number")
-                if not phone:
-                    continue
-                sender = msg.get("from", {}) or {}
-                first_name = contact.get("first_name") or sender.get("first_name") or ""
-                last_name = contact.get("last_name") or sender.get("last_name") or ""
-                username = sender.get("username") or ""
 
-                changed, _ = upsert_subscriber(
-                    chat_id,
-                    phone_number=phone,
-                    first_name=first_name,
-                    last_name=last_name,
-                    username=username,
-                    is_subscribed=True,
-                    path=SUBS_FILE,
-                )
-                subs_changed = subs_changed or changed
-                clear_conversation(state, chat_id)
-                try:
-                    send_contact_confirmation(chat_id)
-                    send_menu(chat_id, prepend_text="اشتراک شما فعال است؛ گزینه‌های زیر در دسترس هستند.")
-                except Exception as exc:
-                    print(f"Failed to send confirmation/menu to {chat_id}: {exc}")
-                state_changed = True
-                continue
+                contact = msg.get("contact")
+                if contact:
+                    contact_user_id = contact.get("user_id")
+                    if contact_user_id and str(contact_user_id) != str(chat_id):
+                        continue
+                    phone = contact.get("phone_number")
+                    if not phone:
+                        continue
+                    sender = msg.get("from", {}) or {}
+                    first_name = contact.get("first_name") or sender.get("first_name") or ""
+                    last_name = contact.get("last_name") or sender.get("last_name") or ""
+                    username = sender.get("username") or ""
 
-            raw_text = msg.get("text") or ""
-            text_lower = raw_text.strip().lower()
-
-            if text_lower in ("/start", "/subscribe", "start"):
-                try:
-                    send_start_prompt(chat_id, already_registered=bool(existing and existing.get("phone_number")))
-                except Exception as exc:
-                    print(f"Failed to send start prompt to {chat_id}: {exc}")
-                continue
-
-            if text_lower in ("/stop", "/unsubscribe", "stop"):
-                changed, _ = (
-                    upsert_subscriber(
-                        chat_id,
-                        phone_number=existing.get("phone_number") if existing else None,
-                        first_name=existing.get("first_name") if existing else None,
-                        last_name=existing.get("last_name") if existing else None,
-                        username=existing.get("username") if existing else None,
-                        is_subscribed=False,
-                        path=SUBS_FILE,
-                    )
-                    if existing
-                    else upsert_subscriber(chat_id, is_subscribed=False, path=SUBS_FILE)
-                )
-                subs_changed = subs_changed or changed
-                clear_conversation(state, chat_id)
-                try:
-                    send_unsubscribe_confirmation(chat_id)
-                except Exception as exc:
-                    print(f"Failed to send unsubscribe confirmation to {chat_id}: {exc}")
-                state_changed = True
-                continue
-
-            if text_lower in ("/menu", "menu"):
-                try:
-                    send_menu(chat_id)
-                except Exception as exc:
-                    print(f"Failed to send menu to {chat_id}: {exc}")
-                continue
-
-            if text_lower in ("/get", "get"):
-                handle_get_updates_now(chat_id)
-                continue
-
-            if text_lower in ("/donate", "donate"):
-                state_changed = handle_donate_stars_start(state, chat_id) or state_changed
-                continue
-
-            if text_lower in ("/add", "add"):
-                state_changed = handle_add_asset_start(state, chat_id) or state_changed
-                continue
-
-            if text_lower in ("/remove", "remove"):
-                state_changed = handle_remove_asset_start(state, chat_id) or state_changed
-                continue
-
-            if text_lower.startswith("/terms"):
-                try:
-                    send_telegram(str(chat_id), TERMS_MESSAGE)
-                except Exception as exc:  # pragma: no cover
-                    print(f"Failed to send terms message to {chat_id}: {exc}")
-                continue
-
-            if text_lower.startswith("/paysupport"):
-                try:
-                    send_telegram(str(chat_id), PAY_SUPPORT_MESSAGE)
-                except Exception as exc:  # pragma: no cover
-                    print(f"Failed to send pay support message to {chat_id}: {exc}")
-                continue
-
-            if text_lower in ("/help", "help"):
-                try:
-                    send_telegram(str(chat_id), HELP_MESSAGE)
-                except Exception as exc:  # pragma: no cover
-                    print(f"Failed to send help message to {chat_id}: {exc}")
-                continue
-
-            if text_lower.startswith("/donations"):
-                if not is_admin(chat_id):
                     try:
-                        send_telegram(str(chat_id), "دسترسی مجاز نیست.")
-                    except Exception as exc:  # pragma: no cover
-                        print(f"Failed to send unauthorized notice to {chat_id}: {exc}")
-                else:
-                    handle_admin_donations(chat_id)
-                continue
-
-            if text_lower.startswith("/refund"):
-                if not is_admin(chat_id):
-                    try:
-                        send_telegram(str(chat_id), "دسترسی مجاز نیست.")
-                    except Exception as exc:  # pragma: no cover
-                        print(f"Failed to send unauthorized refund notice to {chat_id}: {exc}")
-                else:
-                    handle_refund_request(chat_id, raw_text)
-                continue
-
-            if text_lower in ("/cancel", "cancel"):
-                if conversation:
+                        changed, _ = upsert_subscriber(
+                            chat_id,
+                            phone_number=phone,
+                            first_name=first_name,
+                            last_name=last_name,
+                            username=username,
+                            is_subscribed=True,
+                            awaiting_contact=False,
+                            contact_prompted_at=None,
+                            path=SUBS_FILE,
+                        )
+                        subs_changed = subs_changed or changed
+                    except Exception as exc:
+                        print(f"Failed to save contact for {chat_id}: {exc}")
                     clear_conversation(state, chat_id)
+                    try:
+                        send_contact_confirmation(chat_id)
+                        send_menu(chat_id, prepend_text="اشتراک شما فعال است؛ گزینه‌های زیر در دسترس هستند.")
+                    except Exception as exc:
+                        print(f"Failed to send confirmation/menu to {chat_id}: {exc}")
                     state_changed = True
+                    continue
+
+                raw_text = msg.get("text") or ""
+                text_lower = raw_text.strip().lower()
+
+                if text_lower in ("/start", "/subscribe", "start"):
+                    if existing and existing.get("phone_number"):
+                        try:
+                            send_start_prompt(chat_id, already_registered=True)
+                        except Exception as exc:
+                            print(f"Failed to send start prompt to {chat_id}: {exc}")
+                    else:
+                        handled, changed = ensure_contact_prompt(existing, chat_id)
+                        subs_changed = subs_changed or changed
+                    continue
+
+                if text_lower in ("/stop", "/unsubscribe", "stop"):
                     try:
-                        send_telegram(str(chat_id), "فرآیند جاری لغو شد.")
-                    except Exception as exc:  # pragma: no cover
-                        print(f"Failed to confirm cancel to {chat_id}: {exc}")
-                else:
+                        changed, _ = (
+                            upsert_subscriber(
+                                chat_id,
+                                phone_number=existing.get("phone_number") if existing else None,
+                                first_name=existing.get("first_name") if existing else None,
+                                last_name=existing.get("last_name") if existing else None,
+                                username=existing.get("username") if existing else None,
+                                is_subscribed=False,
+                                awaiting_contact=False,
+                                contact_prompted_at=None,
+                                path=SUBS_FILE,
+                            )
+                            if existing
+                            else upsert_subscriber(
+                                chat_id,
+                                is_subscribed=False,
+                                awaiting_contact=False,
+                                contact_prompted_at=None,
+                                path=SUBS_FILE,
+                            )
+                        )
+                        subs_changed = subs_changed or changed
+                    except Exception as exc:
+                        print(f"Failed to update subscription for {chat_id}: {exc}")
+                    clear_conversation(state, chat_id)
                     try:
-                        send_telegram(str(chat_id), "هیچ فرآیند فعالی برای لغو وجود ندارد.")
+                        send_unsubscribe_confirmation(chat_id)
+                    except Exception as exc:
+                        print(f"Failed to send unsubscribe confirmation to {chat_id}: {exc}")
+                    state_changed = True
+                    continue
+
+                contact_required_commands = {
+                    "/menu",
+                    "menu",
+                    "/get",
+                    "get",
+                    "/add",
+                    "add",
+                    "/remove",
+                    "remove",
+                    "/donate",
+                    "donate",
+                }
+                if text_lower in contact_required_commands:
+                    handled, changed = ensure_contact_prompt(existing, chat_id)
+                    subs_changed = subs_changed or changed
+                    if handled:
+                        continue
+
+                if text_lower in ("/menu", "menu"):
+                    try:
+                        send_menu(chat_id)
+                    except Exception as exc:
+                        print(f"Failed to send menu to {chat_id}: {exc}")
+                    continue
+
+                if text_lower in ("/get", "get"):
+                    handle_get_updates_now(chat_id)
+                    continue
+
+                if text_lower in ("/donate", "donate"):
+                    state_changed = handle_donate_stars_start(state, chat_id) or state_changed
+                    continue
+
+                if text_lower in ("/add", "add"):
+                    state_changed = handle_add_asset_start(state, chat_id) or state_changed
+                    continue
+
+                if text_lower in ("/remove", "remove"):
+                    state_changed = handle_remove_asset_start(state, chat_id) or state_changed
+                    continue
+
+                if text_lower.startswith("/terms"):
+                    try:
+                        send_telegram(str(chat_id), TERMS_MESSAGE)
                     except Exception as exc:  # pragma: no cover
-                        print(f"Failed to notify no-op cancel for {chat_id}: {exc}")
-                continue
+                        print(f"Failed to send terms message to {chat_id}: {exc}")
+                    continue
 
-            if conversation and conversation.get("state") == "await_donation_custom" and raw_text.strip():
-                state_changed = handle_donate_custom_text(state, chat_id, raw_text) or state_changed
-                continue
+                if text_lower.startswith("/paysupport"):
+                    try:
+                        send_telegram(str(chat_id), PAY_SUPPORT_MESSAGE)
+                    except Exception as exc:  # pragma: no cover
+                        print(f"Failed to send pay support message to {chat_id}: {exc}")
+                    continue
 
-            if conversation and conversation.get("state") == "await_symbol" and raw_text.strip():
-                state_changed = handle_add_asset_text(state, chat_id, raw_text) or state_changed
-                continue
+                if text_lower in ("/help", "help"):
+                    try:
+                        send_telegram(str(chat_id), HELP_MESSAGE)
+                    except Exception as exc:  # pragma: no cover
+                        print(f"Failed to send help message to {chat_id}: {exc}")
+                    continue
 
-            if raw_text.strip():
-                try:
-                    send_telegram(
-                        str(chat_id),
-                        "دستور ناشناخته است. برای مشاهده گزینه‌ها /menu را ارسال کنید.",
-                    )
-                except Exception as exc:  # pragma: no cover
-                    print(f"Failed to send fallback reply to {chat_id}: {exc}")
+                if text_lower.startswith("/donations"):
+                    if not is_admin(chat_id):
+                        try:
+                            send_telegram(str(chat_id), "دسترسی مجاز نیست.")
+                        except Exception as exc:  # pragma: no cover
+                            print(f"Failed to send unauthorized notice to {chat_id}: {exc}")
+                    else:
+                        handle_admin_donations(chat_id)
+                    continue
 
-        if max_update_id != previous_offset:
-            offset = max_update_id + 1
-            offset_changed = True
+                if text_lower.startswith("/refund"):
+                    if not is_admin(chat_id):
+                        try:
+                            send_telegram(str(chat_id), "دسترسی مجاز نیست.")
+                        except Exception as exc:  # pragma: no cover
+                            print(f"Failed to send unauthorized refund notice to {chat_id}: {exc}")
+                    else:
+                        handle_refund_request(chat_id, raw_text)
+                    continue
+
+                if text_lower in ("/cancel", "cancel"):
+                    if conversation:
+                        clear_conversation(state, chat_id)
+                        state_changed = True
+                        try:
+                            send_telegram(str(chat_id), "فرآیند جاری لغو شد.")
+                        except Exception as exc:  # pragma: no cover
+                            print(f"Failed to confirm cancel to {chat_id}: {exc}")
+                    else:
+                        try:
+                            send_telegram(str(chat_id), "هیچ فرآیند فعالی برای لغو وجود ندارد.")
+                        except Exception as exc:  # pragma: no cover
+                            print(f"Failed to notify no-op cancel for {chat_id}: {exc}")
+                    continue
+
+                if conversation and conversation.get("state") == "await_donation_custom" and raw_text.strip():
+                    state_changed = handle_donate_custom_text(state, chat_id, raw_text) or state_changed
+                    continue
+
+                if conversation and conversation.get("state") == "await_symbol" and raw_text.strip():
+                    state_changed = handle_add_asset_text(state, chat_id, raw_text) or state_changed
+                    continue
+
+                if raw_text.strip():
+                    try:
+                        send_telegram(
+                            str(chat_id),
+                            "دستور ناشناخته است. برای مشاهده گزینه‌ها /menu را ارسال کنید.",
+                        )
+                    except Exception as exc:  # pragma: no cover
+                        print(f"Failed to send fallback reply to {chat_id}: {exc}")
+            finally:
+                if update_id is not None and (
+                    last_processed_update_id is None or update_id > last_processed_update_id
+                ):
+                    last_processed_update_id = update_id
+
+        if last_processed_update_id is not None:
+            next_offset = last_processed_update_id + 1
+            if next_offset != offset:
+                offset = next_offset
+                offset_changed = True
 
     def flush_changes() -> None:
         nonlocal state_changed, subs_changed, offset_changed
@@ -1281,15 +1439,14 @@ def process_updates(duration_seconds: float | None = None, poll_timeout: float =
 
         offset_was_updated = offset_changed
         if offset_changed:
-            offd["offset"] = offset
-            save_json(OFFSET_FILE, offd)
+            save_offset(OFFSET_FILE, offset)
             offset_changed = False
         if state_changed:
             save_state(state)
             state_changed = False
         if subs_changed or offset_was_updated:
             total = count_subscribers(path=SUBS_FILE)
-            print(f"Updated subscribers: {total}, offset: {offd.get('offset', offset)}")
+            print(f"Updated subscribers: {total}, offset: {offset}")
             subs_changed = False
 
     try:
@@ -1315,6 +1472,7 @@ def process_updates(duration_seconds: float | None = None, poll_timeout: float =
             handle_batch(_fetch_updates(offset, 0))
     finally:
         flush_changes()
+
 
 
 def main():  # pragma: no cover - retained for manual execution

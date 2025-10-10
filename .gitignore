@@ -18,6 +18,7 @@ pyvenv.cfg
 subscribers.json
 subscribers.sqlite3
 offset.json
+data/offset.txt
 *.log
 
 # Editors
