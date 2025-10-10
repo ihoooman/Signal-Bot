@@ -5,6 +5,7 @@
 import asyncio
 import threading
 from typing import Optional
+from listen_start import on_start
 
 import listen_start
 
@@ -439,4 +440,5 @@ def run_polling_main() -> None:
         .build()
     )
     app.add_handler(TypeHandler(Update, _dispatch))
+    app.add_handler(CommandHandler("start", on_start))
     app.run_polling(drop_pending_updates=True, stop_signals=None)
