@@ -25,6 +25,16 @@ Subscriber = Dict[str, Any]
 
 _UNSET = object()
 
+
+def _default_assets() -> List[str]:
+    raw = os.getenv("DEFAULT_ASSETS", "XRPUSDT,BTCUSDT,ETHUSDT")
+    assets: List[str] = []
+    for chunk in raw.split(","):
+        token = chunk.strip().upper()
+        if token and token not in assets:
+            assets.append(token)
+    return assets
+
 if SQLA_AVAILABLE:  # pragma: no branch
     _WATCHLIST_METADATA = MetaData()
     _WATCHLIST_TABLE = Table(
@@ -431,22 +441,39 @@ def get_user_watchlist(chat_id: int | str, *, path: Path | None = None) -> List[
     if not chat_id_str:
         return []
 
-    if SQLA_AVAILABLE:
-        engine = _get_engine(path)
-        with engine.connect() as conn:
-            rows = conn.execute(
-                select(_WATCHLIST_TABLE.c.symbol_pair)
-                .where(_WATCHLIST_TABLE.c.user_id == chat_id_str)
-                .order_by(_WATCHLIST_TABLE.c.created_at)
-            ).all()
-        return [row.symbol_pair for row in rows]
+    def _fetch_existing() -> List[str]:
+        if SQLA_AVAILABLE:
+            engine = _get_engine(path)
+            with engine.connect() as conn:
+                rows = conn.execute(
+                    select(_WATCHLIST_TABLE.c.symbol_pair)
+                    .where(_WATCHLIST_TABLE.c.user_id == chat_id_str)
+                    .order_by(_WATCHLIST_TABLE.c.created_at)
+                ).all()
+            return [row.symbol_pair for row in rows]
 
-    with _connect(path) as conn:
-        rows = conn.execute(
-            "SELECT symbol_pair FROM user_watchlist WHERE user_id = ? ORDER BY created_at",
-            (chat_id_str,),
-        ).fetchall()
-    return [row[0] for row in rows]
+        with _connect(path) as conn:
+            rows = conn.execute(
+                "SELECT symbol_pair FROM user_watchlist WHERE user_id = ? ORDER BY created_at",
+                (chat_id_str,),
+            ).fetchall()
+        return [row[0] for row in rows]
+
+    existing = _fetch_existing()
+    if existing:
+        return existing
+
+    defaults = _default_assets()
+    for pair in defaults:
+        try:
+            add_to_watchlist(chat_id_str, pair, path=path)
+        except Exception:
+            continue
+
+    updated = _fetch_existing()
+    if updated:
+        return updated
+    return defaults if defaults else []
 
 
 def remove_from_watchlist(chat_id: int | str, symbol_pair: str, *, path: Path | None = None) -> bool:

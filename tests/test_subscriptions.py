@@ -1,3 +1,4 @@
+import os
 import sqlite3
 import tempfile
 import unittest
@@ -119,6 +120,25 @@ class SubscriptionTests(unittest.TestCase):
         watchlist = get_user_watchlist(77, path=self.db_path)
         self.assertEqual(watchlist, ["SOLUSDT", "BTCUSDT"])
 
+    def test_default_watchlist_seed_once(self):
+        previous = os.environ.get("DEFAULT_ASSETS")
+
+        def _restore():
+            if previous is None:
+                os.environ.pop("DEFAULT_ASSETS", None)
+            else:
+                os.environ["DEFAULT_ASSETS"] = previous
+
+        os.environ["DEFAULT_ASSETS"] = "ADAUSDT,BTCUSDT,ADAUSDT"
+        self.addCleanup(_restore)
+
+        upsert_subscriber(501, phone_number="+123", path=self.db_path)
+        watchlist_first = get_user_watchlist(501, path=self.db_path)
+        self.assertEqual(watchlist_first, ["ADAUSDT", "BTCUSDT"])
+
+        watchlist_second = get_user_watchlist(501, path=self.db_path)
+        self.assertEqual(watchlist_second, ["ADAUSDT", "BTCUSDT"])
+
     def test_remove_from_watchlist(self):
         upsert_subscriber(88, phone_number="+111", path=self.db_path)
         add_to_watchlist(88, "BTCUSDT", path=self.db_path)
@@ -137,7 +157,14 @@ class SubscriptionTests(unittest.TestCase):
         self.assertEqual(get_user_watchlist(200, path=self.db_path), ["SOLUSDT"])
         removed = remove_from_watchlist(200, "SOLUSDT", path=self.db_path)
         self.assertTrue(removed)
-        self.assertEqual(get_user_watchlist(200, path=self.db_path), [])
+        expected_defaults = [
+            chunk.strip().upper()
+            for chunk in os.environ.get(
+                "DEFAULT_ASSETS", "XRPUSDT,BTCUSDT,ETHUSDT"
+            ).split(",")
+            if chunk.strip()
+        ]
+        self.assertEqual(get_user_watchlist(200, path=self.db_path), expected_defaults)
 
     def test_donation_persistence_and_totals(self):
         save_donation(1, 100, "{\"payload\":1}", path=self.db_path)

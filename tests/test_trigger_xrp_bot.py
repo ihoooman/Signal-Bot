@@ -140,6 +140,27 @@ class EmergencyBroadcastTests(unittest.TestCase):
             self.assertTrue(msg_args[0].startswith("broadcast job="))
             self.assertEqual(msg_args[1], "summary")
 
+    def test_render_compact_summary_smoke(self):
+        payload = {
+            "generated_at": "2024-01-01 00:00:00",
+            "counts": {
+                "BUY": 2,
+                "SELL": 1,
+                "NO_ACTION": 3,
+                "emergencies_last_4h": 1,
+            },
+            "highlights": [
+                {"symbol": "BTCUSDT", "line": "BUY signal"},
+                {"symbol": "ETHUSDT", "line": "Hold"},
+            ],
+            "per_user_overrides": False,
+        }
+
+        text = trigger_xrp_bot.render_compact_summary(payload)
+        self.assertIn("BUY", text)
+        self.assertIn("BTCUSDT", text)
+        self.assertIn("🎯", text)
+
 
 if __name__ == "__main__":
     unittest.main()

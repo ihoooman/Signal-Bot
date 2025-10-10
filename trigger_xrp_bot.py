@@ -10,7 +10,7 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
 from pathlib import Path
-from typing import Dict, Iterable, Sequence
+from typing import Dict, Iterable, List, Sequence
 
 SRC_DIR = Path(__file__).resolve().parent / "src"
 if SRC_DIR.exists():
@@ -629,6 +629,119 @@ def _evaluate_pairs(pairs: Iterable[str]) -> Dict[str, dict[str, object]]:
     return results
 
 
+def _build_summary_from_results(
+    results_by_pair: Dict[str, dict[str, object]], *, per_user_overrides: bool
+) -> dict:
+    counts: Dict[str, int] = {"BUY": 0, "SELL": 0, "NO_ACTION": 0}
+    emergencies = 0
+    highlights: List[dict[str, str]] = []
+
+    for pair in sorted(results_by_pair):
+        result = results_by_pair[pair]
+        signal = str(result.get("signal") or "NO ACTION")
+        text = str(result.get("text") or "")
+        canonical_pair = str(result.get("pair") or pair)
+
+        if signal in ("BUY", "SELL"):
+            counts[signal] += 1
+            emergencies += 1
+        elif signal == "ERROR":
+            counts.setdefault("ERROR", 0)
+            counts["ERROR"] += 1
+        else:
+            counts["NO_ACTION"] += 1
+
+        highlights.append({"symbol": canonical_pair, "line": text})
+
+    counts["emergencies_last_4h"] = emergencies
+
+    summary = {
+        "generated_at": tehran_now(),
+        "counts": counts,
+        "highlights": highlights,
+        "per_user_overrides": bool(per_user_overrides),
+    }
+    return summary
+
+
+def run_summary_once(symbols: List[str]) -> dict:
+    """Evaluate ``symbols`` once and return a summary payload."""
+
+    normalised: List[str] = []
+    seen: set[str] = set()
+    for raw in symbols:
+        token = str(raw or "").strip().upper()
+        if not token:
+            continue
+        pair = _normalise_pair(token)
+        if not pair:
+            LOGGER.warning("Skipping unsupported live summary pair %s", token)
+            continue
+        if pair in seen:
+            continue
+        seen.add(pair)
+        normalised.append(pair)
+
+    if not normalised:
+        normalised = sorted(_default_pair_set())
+    else:
+        normalised = sorted(normalised)
+
+    per_user_overrides = set(normalised) != _default_pair_set()
+    results_by_pair = _evaluate_pairs(normalised)
+    return _build_summary_from_results(
+        results_by_pair,
+        per_user_overrides=per_user_overrides,
+    )
+
+
+def render_compact_summary(payload: dict | None) -> str:
+    if not payload:
+        return (
+            "هنوز خلاصه‌ای ثبت نشده است. لطفاً پس از اجرای بعدی ربات دوباره تلاش کنید."
+        )
+
+    counts = payload.get("counts") or {}
+
+    def _as_int(key: str) -> int:
+        try:
+            return int(counts.get(key, 0))
+        except (TypeError, ValueError):
+            return 0
+
+    generated_at = payload.get("generated_at") or tehran_now()
+    emergencies = counts.get("emergencies_last_4h")
+    buy = _as_int("BUY")
+    sell = _as_int("SELL")
+    no_action = _as_int("NO_ACTION")
+
+    lines = [
+        "<b>📬 خلاصه سریع</b>",
+        f"⏱ تولید شده در: {generated_at}",
+        "",
+        f"✅ BUY: <b>{buy}</b>",
+        f"⛔️ SELL: <b>{sell}</b>",
+        f"⚪️ NO ACTION: <b>{no_action}</b>",
+    ]
+
+    if emergencies is not None:
+        try:
+            emergencies_value = int(emergencies)
+        except (TypeError, ValueError):
+            emergencies_value = emergencies
+        lines.extend(["", f"🚨 سیگنال‌های اضطراری ۴ ساعت اخیر: {emergencies_value}"])
+
+    highlights = payload.get("highlights") or []
+    if highlights:
+        lines.extend(["", "🎯 نکات برجسته:"])
+        for item in highlights[:5]:
+            symbol = str(item.get("symbol") or "—")
+            snippet = str(item.get("line") or "")
+            lines.append(f"• <b>{symbol}</b>: {snippet}")
+
+    return "\n".join(lines)
+
+
 def format_compact_summary(results: list[dict[str, object]]) -> str:
     dt = tehran_now()
     lines = [f"<b>📬 On-demand update</b> — {dt}", ""]
@@ -709,40 +822,13 @@ def generate_snapshot_payload() -> dict:
     else:
         required_pairs = sorted(_default_pair_set())
 
-    results_by_pair = _evaluate_pairs(required_pairs)
-    counts = {"BUY": 0, "SELL": 0, "NO_ACTION": 0}
-    emergencies = 0
-    highlights: list[dict[str, str]] = []
-
-    for pair in sorted(results_by_pair):
-        result = results_by_pair[pair]
-        signal = str(result.get("signal") or "NO ACTION")
-        text = str(result.get("text") or "")
-        canonical_pair = result.get("pair") or pair
-
-        if signal in ("BUY", "SELL"):
-            counts[signal] += 1
-            emergencies += 1
-        elif signal == "ERROR":
-            counts.setdefault("ERROR", 0)
-            counts["ERROR"] += 1
-        else:
-            counts["NO_ACTION"] += 1
-
-        highlights.append({"symbol": str(canonical_pair), "line": text})
-
-    counts["emergencies_last_4h"] = emergencies
-
     default_pairs = set(_default_pair_set())
     per_user_overrides = any(set(pairs) != default_pairs for pairs in targets.values())
-
-    snapshot = {
-        "generated_at": tehran_now(),
-        "counts": counts,
-        "highlights": highlights,
-        "per_user_overrides": bool(per_user_overrides),
-    }
-    return snapshot
+    results_by_pair = _evaluate_pairs(required_pairs)
+    return _build_summary_from_results(
+        results_by_pair,
+        per_user_overrides=per_user_overrides,
+    )
 
 
 def run(
