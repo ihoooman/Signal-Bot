@@ -55,6 +55,9 @@ except ModuleNotFoundError:  # pragma: no cover - exercised in tests via monkeyp
         def get_jobs(self):
             return list(self._jobs)
 
+        def remove_job(self, job_id: str):  # pragma: no cover - exercised in tests
+            self._jobs = [job for job in self._jobs if job.id != job_id]
+
         def shutdown(self, wait: bool = False):  # pragma: no cover - no-op
             self._jobs.clear()
 
@@ -128,6 +131,15 @@ def configure_jobs(scheduler: BlockingScheduler | None = None) -> BlockingSchedu
     scheduler = scheduler or BlockingScheduler(timezone=ZoneInfo("Asia/Tehran"))
     tz = ZoneInfo("Asia/Tehran")
 
+    def _safe_remove(job_id: str) -> None:
+        remover = getattr(scheduler, "remove_job", None)
+        if callable(remover):
+            try:
+                remover(job_id)
+            except Exception:  # pragma: no cover - scheduler-specific behaviour
+                pass
+
+    _safe_remove("summary")
     scheduler.add_job(
         job_summary,
         CronTrigger(hour=_summary_hours(), minute=0, timezone=tz),
@@ -137,6 +149,7 @@ def configure_jobs(scheduler: BlockingScheduler | None = None) -> BlockingSchedu
     )
 
     interval = _emergency_interval()
+    _safe_remove("emergency")
     scheduler.add_job(
         job_emergency,
         CronTrigger(hour=f"*/{interval}", minute=0, timezone=tz),

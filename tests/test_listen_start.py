@@ -130,8 +130,11 @@ class AddAssetFlowTests(unittest.TestCase):
             "message": {"message_id": 1, "chat": {"id": 123}, "text": "/get"},
         }
 
-        with mock.patch.object(listen_start.BOT, "get_updates", return_value=[FakeUpdate(update_payload)]), \
-            mock.patch.object(listen_start, "send_telegram") as mock_send:
+        with mock.patch.object(
+            listen_start,
+            "_run_bot_get_updates",
+            return_value=[FakeUpdate(update_payload)],
+        ), mock.patch.object(listen_start, "send_telegram") as mock_send:
             listen_start.process_updates(duration_seconds=0, poll_timeout=0)
 
         mock_send.assert_called_once()
@@ -150,8 +153,15 @@ class AddAssetFlowTests(unittest.TestCase):
             "message": {"message_id": 2, "chat": {"id": 321}, "text": "/donate"},
         }
 
-        with mock.patch.object(listen_start.BOT, "get_updates", return_value=[FakeUpdate(update_payload)]), \
-            mock.patch.object(listen_start, "handle_donate_stars_start", return_value=True) as mock_donate:
+        with mock.patch.object(
+            listen_start,
+            "_run_bot_get_updates",
+            return_value=[FakeUpdate(update_payload)],
+        ), mock.patch.object(
+            listen_start,
+            "handle_donate_stars_start",
+            return_value=True,
+        ) as mock_donate:
             listen_start.process_updates(duration_seconds=0, poll_timeout=0)
 
         mock_donate.assert_called_once()
@@ -169,8 +179,11 @@ class AddAssetFlowTests(unittest.TestCase):
             "message": {"message_id": 3, "chat": {"id": 555}, "text": "/help"},
         }
 
-        with mock.patch.object(listen_start.BOT, "get_updates", return_value=[FakeUpdate(update_payload)]), \
-            mock.patch.object(listen_start, "send_telegram") as mock_send:
+        with mock.patch.object(
+            listen_start,
+            "_run_bot_get_updates",
+            return_value=[FakeUpdate(update_payload)],
+        ), mock.patch.object(listen_start, "send_telegram") as mock_send:
             listen_start.process_updates(duration_seconds=0, poll_timeout=0)
 
         mock_send.assert_called_once()
