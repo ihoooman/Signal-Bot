@@ -1,0 +1,49 @@
+name: Summary broadcast
+
+on:
+  schedule:
+    - cron: '30 0,4,8,12,16,20 * * *'
+  workflow_dispatch:
+
+jobs:
+  summary:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Pre-handle Telegram updates
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          DB_URL: ${{ secrets.DB_URL }}
+          TIMEZONE: 'Asia/Tehran'
+          ADMIN_CHAT_IDS: ${{ secrets.ADMIN_CHAT_IDS }}
+          DONATION_TIERS: '100,500,1000'
+        run: python -m src.signal_bot.ci_entry --mode prehandle
+      - name: Run summary job
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          DB_URL: ${{ secrets.DB_URL }}
+          TIMEZONE: 'Asia/Tehran'
+          ADMIN_CHAT_IDS: ${{ secrets.ADMIN_CHAT_IDS }}
+          DONATION_TIERS: '100,500,1000'
+        run: python -m src.signal_bot.ci_entry --mode summary
+      - name: Update snapshot
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          DB_URL: ${{ secrets.DB_URL }}
+          TIMEZONE: 'Asia/Tehran'
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          ADMIN_CHAT_IDS: ${{ secrets.ADMIN_CHAT_IDS }}
+          DONATION_TIERS: '100,500,1000'
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          python -m src.signal_bot.ci_entry --mode snapshot

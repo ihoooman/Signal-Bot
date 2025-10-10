@@ -3,3 +3,6 @@ pandas
 numpy
 python-dotenv
 tzdata
+APScheduler
+SQLAlchemy>=1.4
+python-telegram-bot>=21.0
