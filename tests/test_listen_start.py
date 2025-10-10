@@ -23,10 +23,14 @@ class AddAssetFlowTests(unittest.TestCase):
         self.prev_subs_file = listen_start.SUBS_FILE
         listen_start.SUBS_FILE = self.subs_path
         self.addCleanup(setattr, listen_start, "SUBS_FILE", self.prev_subs_file)
-        self.offset_path = Path(self.tmpdir.name) / "offset.json"
+        self.offset_path = Path(self.tmpdir.name) / "offset.txt"
         self.prev_offset = listen_start.OFFSET_FILE
         listen_start.OFFSET_FILE = self.offset_path
         self.addCleanup(setattr, listen_start, "OFFSET_FILE", self.prev_offset)
+        self.legacy_offset_path = Path(self.tmpdir.name) / "offset_legacy.json"
+        self.prev_legacy_offset = listen_start.LEGACY_OFFSET_FILE
+        listen_start.LEGACY_OFFSET_FILE = self.legacy_offset_path
+        self.addCleanup(setattr, listen_start, "LEGACY_OFFSET_FILE", self.prev_legacy_offset)
         self.state_path = Path(self.tmpdir.name) / "state.json"
         self.prev_state = listen_start.STATE_FILE
         listen_start.STATE_FILE = self.state_path
@@ -130,6 +134,8 @@ class AddAssetFlowTests(unittest.TestCase):
             "message": {"message_id": 1, "chat": {"id": 123}, "text": "/get"},
         }
 
+        listen_start.upsert_subscriber(123, phone_number="+100", path=self.subs_path)
+
         with mock.patch.object(
             listen_start,
             "_run_bot_get_updates",
@@ -152,6 +158,8 @@ class AddAssetFlowTests(unittest.TestCase):
             "update_id": 2,
             "message": {"message_id": 2, "chat": {"id": 321}, "text": "/donate"},
         }
+
+        listen_start.upsert_subscriber(321, phone_number="+100", path=self.subs_path)
 
         with mock.patch.object(
             listen_start,
@@ -189,6 +197,36 @@ class AddAssetFlowTests(unittest.TestCase):
         mock_send.assert_called_once()
         sent_text = mock_send.call_args[0][1]
         self.assertIn("/menu", sent_text)
+
+    def test_duplicate_updates_do_not_prompt_twice(self):
+        class FakeUpdate:
+            def __init__(self, data):
+                self._data = data
+
+            def to_dict(self):
+                return self._data
+
+        update_payload = {
+            "update_id": 7,
+            "message": {"message_id": 7, "chat": {"id": 999}, "text": "/start"},
+        }
+
+        batches = [
+            [FakeUpdate(update_payload)],
+            [FakeUpdate(update_payload)],
+            [],
+        ]
+
+        def fake_get_updates(offset, timeout):
+            return batches.pop(0) if batches else []
+
+        with mock.patch.object(listen_start, "_run_bot_get_updates", side_effect=fake_get_updates), \
+            mock.patch.object(listen_start, "send_start_prompt") as mock_prompt, \
+            mock.patch.object(listen_start, "send_telegram") as mock_send:
+            listen_start.process_updates(duration_seconds=0.2, poll_timeout=0)
+
+        self.assertEqual(mock_prompt.call_count, 1)
+        mock_send.assert_not_called()
 
     def test_stars_invoice_builds_XTR(self):
         state = {"conversations": {}, "pending_invoices": {}}

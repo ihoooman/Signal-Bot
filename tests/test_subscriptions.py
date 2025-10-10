@@ -1,6 +1,7 @@
 import sqlite3
 import tempfile
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 
 from subscriptions import (
@@ -36,25 +37,60 @@ class SubscriptionTests(unittest.TestCase):
         self.assertEqual(entry["chat_id"], "12345")
         self.assertEqual(entry["phone_number"], "+989123456789")
         self.assertTrue(entry["is_subscribed"])
+        self.assertFalse(entry["awaiting_contact"])
+        self.assertIsNone(entry["contact_prompted_at"])
 
         fetched = get_subscriber(12345, path=self.db_path)
         self.assertIsNotNone(fetched)
         self.assertEqual(fetched["phone_number"], "+989123456789")
+        self.assertFalse(fetched["awaiting_contact"])
+        self.assertIsNone(fetched["contact_prompted_at"])
 
     def test_unsubscribe_updates_existing(self):
         upsert_subscriber(54321, phone_number="+15551234567", path=self.db_path)
         changed, entry = upsert_subscriber(54321, is_subscribed=False, path=self.db_path)
         self.assertTrue(changed)
         self.assertFalse(entry["is_subscribed"])
+        self.assertFalse(entry["awaiting_contact"])
+        self.assertIsNone(entry["contact_prompted_at"])
 
         fetched = get_subscriber(54321, path=self.db_path)
         self.assertFalse(fetched["is_subscribed"])
+        self.assertFalse(fetched["awaiting_contact"])
 
     def test_duplicate_contact_is_noop(self):
         upsert_subscriber(999, phone_number="+15550000000", path=self.db_path)
         changed, entry = upsert_subscriber(999, phone_number="+1 (555) 000-0000", path=self.db_path)
         self.assertFalse(changed)
         self.assertEqual(entry["phone_number"], "+15550000000")
+
+    def test_contact_prompt_fields_persist(self):
+        now = datetime.now(timezone.utc)
+        changed, entry = upsert_subscriber(
+            321,
+            is_subscribed=False,
+            awaiting_contact=True,
+            contact_prompted_at=now,
+            path=self.db_path,
+        )
+        self.assertTrue(changed)
+        self.assertTrue(entry["awaiting_contact"])
+        self.assertIsNotNone(entry["contact_prompted_at"])
+
+        fetched = get_subscriber(321, path=self.db_path)
+        self.assertTrue(fetched["awaiting_contact"])
+        self.assertEqual(fetched["contact_prompted_at"], entry["contact_prompted_at"])
+
+        changed_again, entry_again = upsert_subscriber(
+            321,
+            phone_number="+1999",
+            awaiting_contact=False,
+            contact_prompted_at=None,
+            path=self.db_path,
+        )
+        self.assertTrue(changed_again)
+        self.assertFalse(entry_again["awaiting_contact"])
+        self.assertIsNone(entry_again["contact_prompted_at"])
 
     def test_db_constraints_exist(self):
         upsert_subscriber(1, phone_number="+111", path=self.db_path)

@@ -23,6 +23,8 @@ except ModuleNotFoundError:  # pragma: no cover
 
 Subscriber = Dict[str, Any]
 
+_UNSET = object()
+
 if SQLA_AVAILABLE:  # pragma: no branch
     _WATCHLIST_METADATA = MetaData()
     _WATCHLIST_TABLE = Table(
@@ -41,6 +43,19 @@ else:
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _normalise_timestamp(value: Any) -> str | None:
+    if value is None or value is _UNSET:
+        return None
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc).isoformat()
+    if isinstance(value, str):
+        cleaned = value.strip()
+        return cleaned or None
+    return None
 
 
 def _normalise_phone_number(phone_number: str) -> str:
@@ -112,6 +127,8 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
             last_name TEXT,
             username TEXT,
             is_subscribed INTEGER NOT NULL DEFAULT 1,
+            awaiting_contact INTEGER NOT NULL DEFAULT 0,
+            contact_prompted_at TEXT,
             subscribed_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
         )
@@ -156,6 +173,16 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
         ON donations(user_id)
         """
     )
+    try:
+        conn.execute(
+            "ALTER TABLE subscribers ADD COLUMN awaiting_contact INTEGER NOT NULL DEFAULT 0"
+        )
+    except sqlite3.OperationalError:
+        pass
+    try:
+        conn.execute("ALTER TABLE subscribers ADD COLUMN contact_prompted_at TEXT")
+    except sqlite3.OperationalError:
+        pass
 
 
 @contextmanager
@@ -179,6 +206,8 @@ def _row_to_subscriber(row: sqlite3.Row) -> Subscriber:
         "last_name": row["last_name"] or "",
         "username": row["username"] or "",
         "is_subscribed": bool(row["is_subscribed"]),
+        "awaiting_contact": bool(row["awaiting_contact"]),
+        "contact_prompted_at": row["contact_prompted_at"],
         "subscribed_at": row["subscribed_at"],
         "updated_at": row["updated_at"],
     }
@@ -187,7 +216,7 @@ def _row_to_subscriber(row: sqlite3.Row) -> Subscriber:
 def load_subscribers(path: Path | None = None) -> List[Subscriber]:
     with _connect(path) as conn:
         rows = conn.execute(
-            "SELECT tg_user_id, phone_e164, first_name, last_name, username, is_subscribed, subscribed_at, updated_at "
+            "SELECT tg_user_id, phone_e164, first_name, last_name, username, is_subscribed, awaiting_contact, contact_prompted_at, subscribed_at, updated_at "
             "FROM subscribers ORDER BY subscribed_at"
         ).fetchall()
     return [_row_to_subscriber(row) for row in rows]
@@ -200,7 +229,7 @@ def get_subscriber(chat_id: int | str, *, path: Path | None = None) -> Subscribe
 
     with _connect(path) as conn:
         row = conn.execute(
-            "SELECT tg_user_id, phone_e164, first_name, last_name, username, is_subscribed, subscribed_at, updated_at "
+            "SELECT tg_user_id, phone_e164, first_name, last_name, username, is_subscribed, awaiting_contact, contact_prompted_at, subscribed_at, updated_at "
             "FROM subscribers WHERE tg_user_id = ?",
             (chat_id_str,),
         ).fetchone()
@@ -215,6 +244,8 @@ def upsert_subscriber(
     last_name: str | None = None,
     username: str | None = None,
     is_subscribed: bool = True,
+    awaiting_contact: bool | object = _UNSET,
+    contact_prompted_at: datetime | str | None | object = _UNSET,
     path: Path | None = None,
 ) -> Tuple[bool, Subscriber]:
     chat_id_str = str(chat_id).strip()
@@ -228,12 +259,14 @@ def upsert_subscriber(
 
     with _connect(path) as conn:
         row = conn.execute(
-            "SELECT phone_e164, first_name, last_name, username, is_subscribed, subscribed_at, updated_at "
+            "SELECT phone_e164, first_name, last_name, username, is_subscribed, awaiting_contact, contact_prompted_at, subscribed_at, updated_at "
             "FROM subscribers WHERE tg_user_id = ?",
             (chat_id_str,),
         ).fetchone()
 
         now = _now_iso()
+        awaiting_value = bool(awaiting_contact) if awaiting_contact is not _UNSET else False
+        prompted_value = _normalise_timestamp(contact_prompted_at) if contact_prompted_at is not _UNSET else None
         if row is None:
             subscriber = {
                 "chat_id": chat_id_str,
@@ -242,14 +275,16 @@ def upsert_subscriber(
                 "last_name": last_name,
                 "username": username,
                 "is_subscribed": bool(is_subscribed),
+                "awaiting_contact": awaiting_value,
+                "contact_prompted_at": prompted_value,
                 "subscribed_at": now,
                 "updated_at": now,
             }
             conn.execute(
                 """
                 INSERT INTO subscribers (
-                    tg_user_id, phone_e164, first_name, last_name, username, is_subscribed, subscribed_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    tg_user_id, phone_e164, first_name, last_name, username, is_subscribed, awaiting_contact, contact_prompted_at, subscribed_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     chat_id_str,
@@ -258,6 +293,8 @@ def upsert_subscriber(
                     last_name or None,
                     username or None,
                     1 if is_subscribed else 0,
+                    1 if awaiting_value else 0,
+                    prompted_value,
                     now,
                     now,
                 ),
@@ -272,6 +309,8 @@ def upsert_subscriber(
             "last_name": row["last_name"] or "",
             "username": row["username"] or "",
             "is_subscribed": bool(row["is_subscribed"]),
+            "awaiting_contact": bool(row["awaiting_contact"]),
+            "contact_prompted_at": row["contact_prompted_at"],
             "subscribed_at": row["subscribed_at"],
             "updated_at": row["updated_at"],
         }
@@ -293,12 +332,22 @@ def upsert_subscriber(
         if existing["is_subscribed"] != bool(is_subscribed):
             new_values["is_subscribed"] = bool(is_subscribed)
             changed = True
+        if awaiting_contact is not _UNSET:
+            awaiting_bool = bool(awaiting_contact)
+            if existing["awaiting_contact"] != awaiting_bool:
+                new_values["awaiting_contact"] = awaiting_bool
+                changed = True
+        if contact_prompted_at is not _UNSET:
+            normalised_prompt = _normalise_timestamp(contact_prompted_at)
+            if existing["contact_prompted_at"] != normalised_prompt:
+                new_values["contact_prompted_at"] = normalised_prompt
+                changed = True
         if changed:
             new_values["updated_at"] = now
             conn.execute(
                 """
                 UPDATE subscribers
-                SET phone_e164 = ?, first_name = ?, last_name = ?, username = ?, is_subscribed = ?, updated_at = ?
+                SET phone_e164 = ?, first_name = ?, last_name = ?, username = ?, is_subscribed = ?, awaiting_contact = ?, contact_prompted_at = ?, updated_at = ?
                 WHERE tg_user_id = ?
                 """,
                 (
@@ -307,6 +356,8 @@ def upsert_subscriber(
                     new_values["last_name"] or None,
                     new_values["username"] or None,
                     1 if new_values["is_subscribed"] else 0,
+                    1 if new_values["awaiting_contact"] else 0,
+                    new_values["contact_prompted_at"],
                     new_values["updated_at"],
                     chat_id_str,
                 ),
@@ -314,6 +365,7 @@ def upsert_subscriber(
             conn.commit()
             return True, new_values
         return False, existing
+
 
 
 def get_active_chat_ids(path: Path | None = None) -> List[str]:

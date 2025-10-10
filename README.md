@@ -70,7 +70,7 @@ python listen_start.py
 Behind the scenes:
 - `listen_start.py` now replies to `/start` with a one-tap "📱 ارسال شماره من" button. Users become subscribed only after sharing their Telegram phone number, which is stored in a SQLite database alongside their chat id.
 - `listen_updates.py` is a thin wrapper around `listen_start.py` for backwards compatibility.
-- `offset.json` prevents duplicate processing. Keep both files private; they contain user identifiers.
+- `data/offset.txt` prevents duplicate processing and is updated after every batch so repeated Telegram fetches stay idempotent. Keep both files private; they contain user identifiers.
 - Override the storage path with `SUBSCRIBERS_DB_PATH` when you want to place the database outside the repository (e.g., on a persistent volume). The schema enforces a unique Telegram user id and an index on phone numbers for quick lookups.
 - After a contact is registered the bot sends an inline menu with four bilingual buttons: "📬 دریافت فوری / Get updates now" replies with the most recent cached BUY / SELL / NO ACTION snapshot (no live compute inside GitHub Actions) and highlights any emergencies captured in that snapshot, "➕ افزودن ارز / Add asset" lets the user extend their personal watchlist (default quote `USDT` unless they type another quote such as `SOLUSDC`), "🗑️ حذف ارز / Remove asset" removes pairs from the per-user watchlist with confirmation prompts and pagination when needed, and "💖 دونیت با استارز / Donate with Stars" opens the Telegram Stars drawer with preconfigured tiers (default `DONATION_TIERS`) plus a custom amount prompt.
 - Each selection is stored in the SQLite database under `user_watchlist (user_id, symbol_pair, created_at)` with uniqueness enforced per user, so the two-hour emergency sweep, four-hour summaries, and on-demand updates always include custom pairs.
@@ -114,19 +114,21 @@ Secrets to configure:
 
 `python -m src.signal_bot.ci_entry --mode <stage>` is the single entry point each job calls, so you can reproduce the GitHub Actions behaviour locally (`prehandle`, `emergency`, `summary`, `snapshot`).
 
+> **Worker mode:** When you run a dedicated poller (for example a Render Worker) keep the process scale at 1 and disable the `prehandle` stage in GitHub Actions. Only one consumer should call `getUpdates` at a time to avoid duplicate prompts.
+
 If APScheduler is unavailable in your environment, `schedule_jobs.py` will log a warning and exit so you can fall back to an external cron or workflow runner without the bot crashing.
 
 ## Repository layout
 - `trigger_xrp_bot.py` — signal engine and Telegram broadcaster.
 - `listen_start.py`, `listen_updates.py` — helper scripts for capturing subscribers.
 - `send_test.py` — quick health-check for bot credentials.
-- `subscribers.sqlite3`, `offset.json` — runtime data stores (excluded from git).
+- `subscribers.sqlite3`, `data/offset.txt` — runtime data stores (excluded from git).
 - `requirements.txt` — Python dependencies.
 - `.github/workflows/` — ready-to-use automation pipelines.
 - `.env.example` — starter template for configuration.
 
 ## Security checklist
-- Never commit `.env`, `subscribers.json`, or `offset.json`. They are already ignored in `.gitignore`.
+- Never commit `.env`, `subscribers.json`, or `data/offset.txt`. They are already ignored in `.gitignore`.
 - Rotate your Telegram bot token if it ever leaks.
 - Use a dedicated CryptoCompare key so you can monitor usage and revoke access without downtime.
 - When running on shared infrastructure, set `SUBSCRIBERS_DB_PATH` to a protected directory with restricted permissions.
