@@ -523,4 +523,7 @@ def run_polling_main() -> None:
         .build()
     )
     _register_handlers(app, _dispatch)
+    import listen_start
+
+    listen_start.register_start_handler(app)
     app.run_polling(drop_pending_updates=True, stop_signals=None)
