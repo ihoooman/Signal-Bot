@@ -526,6 +526,55 @@ def _migrate_postgres_boolean_columns(conn: Any) -> None:
     LOGGER.info("Migrated boolean columns in subscribers table")
 
 
+def _postgres_column_type(conn: Any, column: str) -> str | None:
+    query = """
+        SELECT data_type
+        FROM information_schema.columns
+        WHERE table_schema = current_schema()
+          AND table_name = 'subscribers'
+          AND column_name = %s
+    """
+    with conn.cursor() as cur:
+        cur.execute(query, (column,))
+        row = cur.fetchone()
+    if not row:
+        return None
+    value = row[0]
+    if isinstance(value, str):
+        return value.lower()
+    return None
+
+
+def _migrate_postgres_boolean_columns(conn: Any) -> None:
+    columns = ("is_subscribed", "awaiting_contact")
+    needs_migration = []
+    for column in columns:
+        column_type = _postgres_column_type(conn, column)
+        if column_type and column_type not in {"boolean", "bool"}:
+            needs_migration.append(column)
+    if not needs_migration:
+        return
+
+    statements = [
+        f"""
+        ALTER TABLE subscribers
+        ALTER COLUMN {column} TYPE BOOLEAN
+        USING (
+            CASE
+                WHEN {column} IN (1, '1', TRUE, 't') THEN TRUE
+                ELSE FALSE
+            END
+        )
+        """
+        for column in needs_migration
+    ]
+
+    with conn.cursor() as cur:
+        for stmt in statements:
+            cur.execute(stmt)
+    LOGGER.info("Migrated boolean columns in subscribers table")
+
+
 def _execute(conn: Any, query: str, params: Tuple[Any, ...] = (), *, fetchone: bool = False, fetchall: bool = False):
     statement = _sql(query)
     if _USE_POSTGRES:
