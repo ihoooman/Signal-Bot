@@ -21,19 +21,37 @@ from signal_bot.services.instruments import (
     get_instrument_by_pair,
 )
 
-from subscriptions import get_user_watchlist, load_subscribers
+from subscriptions import (
+    describe_backend,
+    ensure_database_ready,
+    get_user_watchlist,
+    load_subscribers,
+)
 
 # در اکشن‌های گیت‌هاب، مسیر خانگی شما وجود ندارد؛ پس مسیر نسبی به خود فایل را پیش‌فرض می‌گیریم
 logging.basicConfig(level=logging.INFO)
 LOGGER = logging.getLogger(__name__)
 
-_DEFAULT_SUBS = os.path.join(os.path.dirname(__file__), "subscribers.sqlite3")
-_ALT_SUBS     = os.path.expanduser("~/xrpbot-1/subscribers.sqlite3")
+_DEFAULT_SUBS = Path(__file__).with_name("subscribers.sqlite3")
+_ALT_SUBS = Path("~/xrpbot-1/subscribers.sqlite3").expanduser()
 _SUBS_OVERRIDE = os.getenv("SUBSCRIBERS_DB_PATH") or os.getenv("SUBSCRIBERS_PATH")
-SUBSCRIBERS_PATH = _SUBS_OVERRIDE or (
-    _DEFAULT_SUBS if os.path.exists(os.path.dirname(__file__)) else _ALT_SUBS
+SUBSCRIBERS_PATH = (
+    Path(_SUBS_OVERRIDE).expanduser()
+    if _SUBS_OVERRIDE
+    else (_DEFAULT_SUBS if os.path.exists(os.path.dirname(__file__)) else _ALT_SUBS)
 )
 _DEFAULT_EMERGENCY_STATE = Path(__file__).with_name("emergency_state.json")
+
+LOGGER.info("Subscriber storage backend: %s", describe_backend(path=SUBSCRIBERS_PATH))
+
+
+def _subscriber_store_path() -> Path:
+    return SUBSCRIBERS_PATH
+
+
+def _load_all_subscribers() -> List[dict[str, object]]:
+    ensure_database_ready(path=_subscriber_store_path())
+    return load_subscribers(_subscriber_store_path())
 
 # ====== تنظیمات از .env ======
 _REPO_ROOT = Path(__file__).resolve().parent
@@ -777,8 +795,8 @@ def generate_on_demand_update(
     *,
     emergency_state_path: Path | None = None,
 ) -> tuple[list[str], list[dict[str, object]]]:
-    subs_path = Path(SUBSCRIBERS_PATH).expanduser()
-    subscribers = load_subscribers(subs_path)
+    subs_path = _subscriber_store_path()
+    subscribers = _load_all_subscribers()
     targets = _collect_user_targets(
         subscribers,
         subs_path,
@@ -808,8 +826,8 @@ def generate_on_demand_update(
 
 
 def generate_snapshot_payload() -> dict:
-    subs_path = Path(SUBSCRIBERS_PATH).expanduser()
-    subscribers = load_subscribers(subs_path)
+    subs_path = _subscriber_store_path()
+    subscribers = _load_all_subscribers()
     targets = _collect_user_targets(
         subscribers,
         subs_path,
@@ -838,8 +856,8 @@ def run(
     target_chat_ids: Sequence[str] | None = None,
     persist_state: bool = True,
 ) -> bool:
-    subs_path = Path(SUBSCRIBERS_PATH).expanduser()
-    subscribers = load_subscribers(subs_path)
+    subs_path = _subscriber_store_path()
+    subscribers = _load_all_subscribers()
     targets = _collect_user_targets(
         subscribers,
         subs_path,
@@ -849,7 +867,7 @@ def run(
 
     if not targets:
         raise RuntimeError(
-            "No Telegram chat IDs configured. Set TELEGRAM_CHAT_ID or add IDs to subscribers.json"
+            "No Telegram chat IDs configured. Set TELEGRAM_CHAT_ID or add IDs to the subscriber database"
         )
 
     required_pairs = sorted({pair for pairs in targets.values() for pair in pairs})

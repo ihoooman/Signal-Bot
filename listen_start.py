@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 import asyncio
 import inspect
+import logging
 import os, json, math, re, requests, sys, time, uuid
 from datetime import datetime, timedelta, timezone
 from functools import lru_cache
@@ -35,11 +36,16 @@ from subscriptions import (
     get_subscriber,
     get_user_watchlist,
     list_recent_donations,
+    load_latest_summary,
     remove_from_watchlist,
     save_donation,
+    save_summary,
     upsert_subscriber,
 )
 from trigger_xrp_bot import render_compact_summary, run_summary_once, send_telegram
+
+logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO").upper())
+LOGGER = logging.getLogger("signal_bot.listen_start")
 
 REPO_ROOT = Path(__file__).resolve().parent
 for candidate in (os.getenv("ENV_FILE"), REPO_ROOT / ".env", Path("~/xrpbot/.env").expanduser()):
@@ -248,6 +254,7 @@ def ensure_contact_prompt(existing: dict | None, chat_id: int | str) -> tuple[bo
     record_changed = False
 
     if should_send_keyboard:
+        LOGGER.info("Prompting %s to share contact details", chat_id)
         try:
             send_start_prompt(chat_id, already_registered=False)
         except Exception as exc:  # pragma: no cover - network failure
@@ -264,8 +271,10 @@ def ensure_contact_prompt(existing: dict | None, chat_id: int | str) -> tuple[bo
                 contact_prompted_at=now,
                 path=SUBS_FILE,
             )
+            if record_changed:
+                LOGGER.info("Marked subscriber %s as awaiting contact", chat_id)
         except Exception as exc:  # pragma: no cover - db failure
-            print(f"Failed to record contact prompt state for {chat_id}: {exc}")
+            LOGGER.exception("Failed to record contact prompt state for %s", chat_id)
     else:
         try:
             send_telegram(str(chat_id), CONTACT_PENDING_MESSAGE)
@@ -369,6 +378,10 @@ def _parse_summary_timestamp(value: str | None) -> datetime | None:
 
 
 def _load_snapshot(path: Path | None = None) -> dict | None:
+    summary = load_latest_summary(path=SUBS_FILE)
+    if summary:
+        return summary
+
     candidate = Path(path) if path else SNAPSHOT_PATH
     try:
         with open(candidate, "r", encoding="utf-8") as f:
@@ -383,6 +396,8 @@ def _load_snapshot(path: Path | None = None) -> dict | None:
 
 
 def _save_snapshot(payload: dict, path: Path | None = None) -> None:
+    save_summary(payload, path=SUBS_FILE)
+
     candidate = Path(path) if path else SNAPSHOT_PATH
     candidate.parent.mkdir(parents=True, exist_ok=True)
     with open(candidate, "w", encoding="utf-8") as f:
@@ -1305,8 +1320,9 @@ def process_updates(duration_seconds: float | None = None, poll_timeout: float =
                     last_name = contact.get("last_name") or sender.get("last_name") or ""
                     username = sender.get("username") or ""
 
+                    LOGGER.info("Received contact payload from chat_id=%s", chat_id)
                     try:
-                        changed, _ = upsert_subscriber(
+                        changed, saved = upsert_subscriber(
                             chat_id,
                             phone_number=phone,
                             first_name=first_name,
@@ -1318,19 +1334,66 @@ def process_updates(duration_seconds: float | None = None, poll_timeout: float =
                             path=SUBS_FILE,
                         )
                         subs_changed = subs_changed or changed
+                        if saved:
+                            phone_for_log = saved.get("phone_number", "")
+                            if isinstance(phone_for_log, str) and len(phone_for_log) > 6:
+                                phone_for_log = f"{phone_for_log[:4]}…{phone_for_log[-2:]}"
+                            LOGGER.info(
+                                "Saved contact for chat_id=%s phone=%s",
+                                chat_id,
+                                phone_for_log,
+                            )
                     except Exception as exc:
-                        print(f"Failed to save contact for {chat_id}: {exc}")
-                    clear_conversation(state, chat_id)
-                    try:
-                        send_contact_confirmation(chat_id)
-                        send_menu(chat_id, prepend_text="اشتراک شما فعال است؛ گزینه‌های زیر در دسترس هستند.")
-                    except Exception as exc:
-                        print(f"Failed to send confirmation/menu to {chat_id}: {exc}")
-                    state_changed = True
+                        LOGGER.exception("Failed to save contact for %s", chat_id)
+                        saved = None
+                    else:
+                        if saved:
+                            clear_conversation(state, chat_id)
+                            try:
+                                send_contact_confirmation(chat_id)
+                                send_menu(
+                                    chat_id,
+                                    prepend_text="اشتراک شما فعال است؛ گزینه‌های زیر در دسترس هستند.",
+                                )
+                            except Exception as exc:
+                                print(f"Failed to send confirmation/menu to {chat_id}: {exc}")
+                            state_changed = True
+                        else:
+                            try:
+                                send_telegram(
+                                    str(chat_id),
+                                    "ثبت شماره با خطا مواجه شد. لطفاً چند لحظه بعد دوباره تلاش کنید.",
+                                )
+                            except Exception as exc:
+                                print(f"Failed to notify contact failure for {chat_id}: {exc}")
                     continue
 
                 raw_text = msg.get("text") or ""
                 text_lower = raw_text.strip().lower()
+
+                if text_lower == "/debug":
+                    if str(chat_id) not in ADMIN_CHAT_IDS:
+                        try:
+                            send_telegram(str(chat_id), "این دستور فقط برای ادمین فعال است.")
+                        except Exception as exc:
+                            print(f"Failed to send non-admin debug notice to {chat_id}: {exc}")
+                        continue
+
+                    current = get_subscriber(chat_id, path=SUBS_FILE)
+                    if current:
+                        debug_message = (
+                            "اطلاعات شما در دیتابیس:\n"
+                            f"• chat_id: {current.get('chat_id')}\n"
+                            f"• phone_number: {current.get('phone_number', '')}\n"
+                            f"• subscribed: {'✅' if current.get('is_subscribed') else '❌'}"
+                        )
+                    else:
+                        debug_message = "هیچ اطلاعاتی برای شما ثبت نشده است."
+                    try:
+                        send_telegram(str(chat_id), debug_message)
+                    except Exception as exc:
+                        print(f"Failed to send debug info to {chat_id}: {exc}")
+                    continue
 
                 if text_lower in ("/start", "/subscribe", "start"):
                     if existing and existing.get("phone_number"):
