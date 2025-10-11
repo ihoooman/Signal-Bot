@@ -8,7 +8,7 @@ from datetime import datetime, timedelta, timezone
 from functools import lru_cache
 from pathlib import Path
 from zoneinfo import ZoneInfo
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable
 from dotenv import load_dotenv
 try:
     from telegram import Bot as TelegramBot, KeyboardButton, ReplyKeyboardMarkup
@@ -259,7 +259,11 @@ def _parse_contact_timestamp(value: str | None) -> datetime | None:
 
 
 def ensure_contact_prompt(
-    existing: dict | None, chat_id: int | str, *, command: str | None = None
+    existing: dict | None,
+    chat_id: int | str,
+    *,
+    command: str | None = None,
+    prompt_callback: Callable[[bool], None] | None = None,
 ) -> tuple[bool, bool]:
     normalized_command = (command or "").strip().lstrip("/").lower()
     if is_admin(chat_id) or normalized_command == "debug":
@@ -284,10 +288,21 @@ def ensure_contact_prompt(
 
     if should_send_keyboard:
         LOGGER.info("Prompting %s to share contact details", chat_id)
-        try:
-            send_start_prompt(chat_id, already_registered=False)
-        except Exception as exc:  # pragma: no cover - network failure
-            print(f"Failed to send contact prompt to {chat_id}: {exc}")
+        already_registered = bool(
+            isinstance(existing, dict) and existing.get("phone_number")
+        )
+        if prompt_callback is not None:
+            try:
+                prompt_callback(already_registered)
+            except Exception as exc:  # pragma: no cover - callback errors
+                LOGGER.warning(
+                    "Contact prompt callback failed for %s: %s", chat_id, exc
+                )
+        else:
+            try:
+                send_start_prompt(chat_id, already_registered=already_registered)
+            except Exception as exc:  # pragma: no cover - network failure
+                print(f"Failed to send contact prompt to {chat_id}: {exc}")
         try:
             record_changed, _ = upsert_subscriber(
                 chat_id,
@@ -873,16 +888,20 @@ def handle_refund_request(chat_id: int | str, raw_text: str) -> None:
         print(f"Failed to confirm refund to {chat_id}: {exc}")
 
 
-def send_start_prompt(chat_id: int | str, already_registered: bool = False) -> None:
-    text = (
-        "سلام! برای فعال‌سازی سیگنال‌ها لطفاً روی دکمه «📱 ارسال شماره من» بزنید تا شماره تلگرام شما ثبت شود.\n"
-        "در صورت ثبت قبلی، می‌توانید مجدداً شماره را بفرستید تا اطلاعات به‌روزرسانی شود."
-    )
+def _compose_start_prompt_text(already_registered: bool = False) -> str:
     if already_registered:
-        text = (
+        return (
             "سلام! شماره شما قبلاً ثبت شده است؛ در صورت نیاز به بروزرسانی یا تأیید مجدد"
             " لطفاً روی دکمه «📱 ارسال شماره من» بزنید."
         )
+    return (
+        "سلام! برای فعال‌سازی سیگنال‌ها لطفاً روی دکمه «📱 ارسال شماره من» بزنید تا شماره تلگرام شما ثبت شود.\n"
+        "در صورت ثبت قبلی، می‌توانید مجدداً شماره را بفرستید تا اطلاعات به‌روزرسانی شود."
+    )
+
+
+def send_start_prompt(chat_id: int | str, already_registered: bool = False) -> None:
+    text = _compose_start_prompt_text(already_registered)
 
     keyboard = {
         "keyboard": [[{"text": "📱 ارسال شماره من", "request_contact": True}]],
@@ -1670,16 +1689,60 @@ def process_updates(duration_seconds: float | None = None, poll_timeout: float =
 
 
 async def on_start(update, context):
-    keyboard = [[KeyboardButton("📱 ارسال شماره من", request_contact=True)]]
-    reply_markup = ReplyKeyboardMarkup(
-        keyboard,
-        resize_keyboard=True,
-        one_time_keyboard=True,
+    chat = getattr(update, "effective_chat", None)
+    chat_id = getattr(chat, "id", None)
+    if chat_id is None:
+        return
+
+    existing = get_subscriber(chat_id, path=SUBS_FILE)
+
+    prompt_requests: list[bool] = []
+
+    def _prompt(already_registered: bool) -> None:
+        prompt_requests.append(bool(already_registered))
+
+    handled, _ = ensure_contact_prompt(
+        existing,
+        chat_id,
+        command="start",
+        prompt_callback=_prompt,
     )
-    await update.message.reply_text(
-        "سلام 👋\nبرای فعال‌سازی ربات لطفاً شماره‌ت رو ارسال کن:",
-        reply_markup=reply_markup,
-    )
+
+    if prompt_requests:
+        already_registered = prompt_requests[-1]
+        message = getattr(update, "message", None)
+        if (
+            message is not None
+            and KeyboardButton is not None
+            and ReplyKeyboardMarkup is not None
+        ):
+            keyboard = [[KeyboardButton("📱 ارسال شماره من", request_contact=True)]]
+            reply_markup = ReplyKeyboardMarkup(
+                keyboard,
+                resize_keyboard=True,
+                one_time_keyboard=True,
+            )
+            text = _compose_start_prompt_text(already_registered)
+            try:
+                await message.reply_text(text, reply_markup=reply_markup)
+            except Exception:
+                await asyncio.to_thread(
+                    send_start_prompt,
+                    chat_id,
+                    already_registered=already_registered,
+                )
+        else:
+            await asyncio.to_thread(
+                send_start_prompt,
+                chat_id,
+                already_registered=already_registered,
+            )
+        return
+
+    if handled:
+        return
+
+    await asyncio.to_thread(send_menu, chat_id)
 
 
 def register_start_handler(app):

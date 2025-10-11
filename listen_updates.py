@@ -512,8 +512,13 @@ def run_polling_main() -> None:
     async def _dispatch(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         message = getattr(update, "effective_message", None)
         text = getattr(message, "text", None) if message else None
-        if isinstance(text, str) and text.strip().lower().startswith("/debug"):
-            return
+        if isinstance(text, str):
+            stripped = text.strip()
+            if stripped.lower().startswith("/debug"):
+                return
+            command = stripped.split()[0].split("@", 1)[0].lower()
+            if command == "/start":
+                return
         await worker.process_update(update)
 
     app = (
