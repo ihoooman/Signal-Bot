@@ -8,6 +8,7 @@ from datetime import datetime, timedelta, timezone
 from functools import lru_cache
 from pathlib import Path
 from zoneinfo import ZoneInfo
+from typing import TYPE_CHECKING
 from dotenv import load_dotenv
 try:
     from telegram import Bot as TelegramBot
@@ -27,11 +28,18 @@ SRC_DIR = Path(__file__).resolve().parent / "src"
 if SRC_DIR.exists():
     sys.path.insert(0, str(SRC_DIR))
 
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from telegram import Update
+    from telegram.ext import ContextTypes
+
+import migrate_db
+
 from signal_bot.services.symbol_resolver import ResolutionCandidate, ResolutionResult, resolve_instrument
 
 from subscriptions import (
     add_to_watchlist,
     count_subscribers,
+    describe_backend,
     donation_totals,
     get_subscriber,
     get_user_watchlist,
@@ -46,6 +54,7 @@ from trigger_xrp_bot import render_compact_summary, run_summary_once, send_teleg
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO").upper())
 LOGGER = logging.getLogger("signal_bot.listen_start")
+
 
 REPO_ROOT = Path(__file__).resolve().parent
 for candidate in (os.getenv("ENV_FILE"), REPO_ROOT / ".env", Path("~/xrpbot/.env").expanduser()):
@@ -106,6 +115,9 @@ STATE_FILE = Path(os.getenv("CONVERSATION_STATE_PATH", str(ROOT / "conversation_
 SNAPSHOT_PATH = Path(os.getenv("SNAPSHOT_PATH", str(ROOT / "data" / "last_summary.json"))).expanduser()
 SNAPSHOT_MAX_AGE = timedelta(hours=2)
 
+SCHEMA_LOGGER = logging.getLogger("signal_bot.schema")
+migrate_db.verify_or_create(path=SUBS_FILE, logger=SCHEMA_LOGGER)
+
 ALLOWED_UPDATES = ("message", "callback_query", "pre_checkout_query")
 
 
@@ -152,12 +164,13 @@ def _parse_donation_tiers(raw: str | None) -> list[int]:
     return tiers
 
 
-def _parse_admin_ids(raw: str | None) -> set[str]:
-    ids: set[str] = set()
-    for chunk in (raw or "").split(","):
-        chunk = chunk.strip()
-        if chunk:
-            ids.add(chunk)
+def _parse_admin_ids(raw: str | None) -> set[int]:
+    ids: set[int] = set()
+    for chunk in (raw or "").replace(",", " ").split():
+        try:
+            ids.add(int(chunk))
+        except (TypeError, ValueError):
+            continue
     return ids
 
 
@@ -188,6 +201,9 @@ PAY_SUPPORT_MESSAGE = os.getenv(
     "پشتیبانی پرداخت: برای پیگیری مشکلات پرداخت با پشتیبانی ربات در تماس باشید.",
 )
 ADMIN_CHAT_IDS = _parse_admin_ids(os.getenv("ADMIN_CHAT_IDS"))
+
+DEBUG_NOT_ALLOWED_MESSAGE = "⛔ فقط برای ادمین"
+UNKNOWN_COMMAND_MESSAGE = "دستور ناشناخته است. برای مشاهده گزینه‌ها /menu را ارسال کنید."
 
 MENU_MARKUP = {
     "inline_keyboard": [
@@ -235,7 +251,13 @@ def _parse_contact_timestamp(value: str | None) -> datetime | None:
     return parsed
 
 
-def ensure_contact_prompt(existing: dict | None, chat_id: int | str) -> tuple[bool, bool]:
+def ensure_contact_prompt(
+    existing: dict | None, chat_id: int | str, *, command: str | None = None
+) -> tuple[bool, bool]:
+    normalized_command = (command or "").strip().lstrip("/").lower()
+    if is_admin(chat_id) or normalized_command == "debug":
+        return False, False
+
     if existing and existing.get("phone_number"):
         return False, False
 
@@ -271,10 +293,11 @@ def ensure_contact_prompt(existing: dict | None, chat_id: int | str) -> tuple[bo
                 contact_prompted_at=now,
                 path=SUBS_FILE,
             )
-            if record_changed:
-                LOGGER.info("Marked subscriber %s as awaiting contact", chat_id)
         except Exception as exc:  # pragma: no cover - db failure
             LOGGER.exception("Failed to record contact prompt state for %s", chat_id)
+        else:
+            if record_changed:
+                LOGGER.info("Marked subscriber %s as awaiting contact", chat_id)
     else:
         try:
             send_telegram(str(chat_id), CONTACT_PENDING_MESSAGE)
@@ -467,11 +490,46 @@ def _pop_pending_invoice(state: dict, payload: str) -> dict | None:
 
 
 def is_admin(chat_id: int | str) -> bool:
-    return str(chat_id) in ADMIN_CHAT_IDS
+    try:
+        return int(str(chat_id)) in ADMIN_CHAT_IDS
+    except (TypeError, ValueError):
+        return False
 
 
 def _format_stars(amount: int) -> str:
     return f"{int(amount)}⭐"
+
+
+def _build_debug_message(chat_id: int | str) -> str:
+    current = get_subscriber(chat_id, path=SUBS_FILE)
+    if current:
+        subscribed = "✅" if current.get("is_subscribed") else "❌"
+        return (
+            "اطلاعات شما در دیتابیس:\n"
+            f"• chat_id: {current.get('chat_id')}\n"
+            f"• phone_number: {current.get('phone_number', '')}\n"
+            f"• subscribed: {subscribed}"
+        )
+    return "هیچ اطلاعاتی برای شما ثبت نشده است."
+
+
+async def debug_info(update: "Update", context: "ContextTypes.DEFAULT_TYPE") -> None:
+    message = getattr(update, "effective_message", None)
+    if message is None:
+        return
+
+    user = getattr(update, "effective_user", None)
+    user_id = getattr(user, "id", None)
+    if not is_admin(user_id):
+        LOGGER.info("Rejected /debug command from user=%s", user_id)
+        await message.reply_text(DEBUG_NOT_ALLOWED_MESSAGE)
+        return
+
+    chat = getattr(update, "effective_chat", None)
+    chat_id = getattr(chat, "id", getattr(message, "chat_id", user_id))
+    backend = describe_backend(path=SUBS_FILE)
+    LOGGER.info("Handling /debug for user=%s backend=%s", user_id, backend)
+    await message.reply_text(_build_debug_message(chat_id))
 
 
 def _send_summary_message(chat_id: int | str, payload: dict | None) -> None:
@@ -1243,7 +1301,9 @@ def process_updates(duration_seconds: float | None = None, poll_timeout: float =
                     existing = get_subscriber(chat_id, path=SUBS_FILE)
                     requires_contact = data != "get_updates_now"
                     if requires_contact:
-                        handled, changed = ensure_contact_prompt(existing, chat_id)
+                        handled, changed = ensure_contact_prompt(
+                            existing, chat_id, command=data
+                        )
                         subs_changed = subs_changed or changed
                         if handled:
                             continue
@@ -1370,27 +1430,20 @@ def process_updates(duration_seconds: float | None = None, poll_timeout: float =
 
                 raw_text = msg.get("text") or ""
                 text_lower = raw_text.strip().lower()
+                command_name = (
+                    text_lower.lstrip("/") if text_lower.startswith("/") else text_lower
+                )
 
                 if text_lower == "/debug":
-                    if str(chat_id) not in ADMIN_CHAT_IDS:
+                    if not is_admin(chat_id):
                         try:
-                            send_telegram(str(chat_id), "این دستور فقط برای ادمین فعال است.")
+                            send_telegram(str(chat_id), DEBUG_NOT_ALLOWED_MESSAGE)
                         except Exception as exc:
                             print(f"Failed to send non-admin debug notice to {chat_id}: {exc}")
                         continue
 
-                    current = get_subscriber(chat_id, path=SUBS_FILE)
-                    if current:
-                        debug_message = (
-                            "اطلاعات شما در دیتابیس:\n"
-                            f"• chat_id: {current.get('chat_id')}\n"
-                            f"• phone_number: {current.get('phone_number', '')}\n"
-                            f"• subscribed: {'✅' if current.get('is_subscribed') else '❌'}"
-                        )
-                    else:
-                        debug_message = "هیچ اطلاعاتی برای شما ثبت نشده است."
                     try:
-                        send_telegram(str(chat_id), debug_message)
+                        send_telegram(str(chat_id), _build_debug_message(chat_id))
                     except Exception as exc:
                         print(f"Failed to send debug info to {chat_id}: {exc}")
                     continue
@@ -1402,7 +1455,9 @@ def process_updates(duration_seconds: float | None = None, poll_timeout: float =
                         except Exception as exc:
                             print(f"Failed to send start prompt to {chat_id}: {exc}")
                     else:
-                        handled, changed = ensure_contact_prompt(existing, chat_id)
+                        handled, changed = ensure_contact_prompt(
+                            existing, chat_id, command="start"
+                        )
                         subs_changed = subs_changed or changed
                     continue
 
@@ -1453,7 +1508,9 @@ def process_updates(duration_seconds: float | None = None, poll_timeout: float =
                     "donate",
                 }
                 if text_lower in contact_required_commands:
-                    handled, changed = ensure_contact_prompt(existing, chat_id)
+                    handled, changed = ensure_contact_prompt(
+                        existing, chat_id, command=command_name
+                    )
                     subs_changed = subs_changed or changed
                     if handled:
                         continue
@@ -1547,10 +1604,7 @@ def process_updates(duration_seconds: float | None = None, poll_timeout: float =
 
                 if raw_text.strip():
                     try:
-                        send_telegram(
-                            str(chat_id),
-                            "دستور ناشناخته است. برای مشاهده گزینه‌ها /menu را ارسال کنید.",
-                        )
+                        send_telegram(str(chat_id), UNKNOWN_COMMAND_MESSAGE)
                     except Exception as exc:  # pragma: no cover
                         print(f"Failed to send fallback reply to {chat_id}: {exc}")
             finally:

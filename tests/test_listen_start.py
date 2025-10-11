@@ -1,3 +1,4 @@
+import asyncio
 import json
 import os
 import sys
@@ -49,6 +50,9 @@ class AddAssetFlowTests(unittest.TestCase):
         self.addCleanup(setattr, listen_start, "DONATION_TIERS", self.prev_tiers)
         listen_start._tehran_zone.cache_clear()
         self.addCleanup(listen_start._tehran_zone.cache_clear)
+        self.prev_admins = listen_start.ADMIN_CHAT_IDS
+        listen_start.ADMIN_CHAT_IDS = set()
+        self.addCleanup(setattr, listen_start, "ADMIN_CHAT_IDS", self.prev_admins)
 
     def _sample_summary(self):
         return {
@@ -65,6 +69,55 @@ class AddAssetFlowTests(unittest.TestCase):
             ],
             "per_user_overrides": False,
         }
+
+    def test_contact_prompt_state(self):
+        chat_id = "555"
+        with mock.patch.object(listen_start, "send_start_prompt") as mock_prompt:
+            handled, changed = listen_start.ensure_contact_prompt(None, chat_id)
+
+        self.assertTrue(handled)
+        self.assertTrue(changed)
+        mock_prompt.assert_called_once()
+
+        pending = subscriptions.get_subscriber(chat_id, path=self.subs_path)
+        self.assertIsNotNone(pending)
+        self.assertTrue(pending["awaiting_contact"])
+
+        changed_again, saved = listen_start.upsert_subscriber(
+            chat_id,
+            phone_number="+1555",
+            first_name="Tester",
+            last_name="User",
+            username="tester",
+            is_subscribed=True,
+            awaiting_contact=False,
+            contact_prompted_at=None,
+            path=self.subs_path,
+        )
+
+        self.assertTrue(changed_again)
+        self.assertTrue(saved["is_subscribed"])
+        self.assertFalse(saved["awaiting_contact"])
+        current = subscriptions.get_subscriber(chat_id, path=self.subs_path)
+        self.assertIsNotNone(current)
+        self.assertFalse(current["awaiting_contact"])
+
+    def test_ensure_contact_prompt_skips_admin(self):
+        listen_start.ADMIN_CHAT_IDS = {999}
+        with mock.patch.object(listen_start, "send_start_prompt") as mock_prompt:
+            handled, changed = listen_start.ensure_contact_prompt(None, 999, command="menu")
+
+        self.assertFalse(handled)
+        self.assertFalse(changed)
+        mock_prompt.assert_not_called()
+
+    def test_ensure_contact_prompt_allows_debug_command(self):
+        with mock.patch.object(listen_start, "send_start_prompt") as mock_prompt:
+            handled, changed = listen_start.ensure_contact_prompt(None, "77", command="debug")
+
+        self.assertFalse(handled)
+        self.assertFalse(changed)
+        mock_prompt.assert_not_called()
 
     def test_handle_add_asset_text_adds_pair_and_clears_state(self):
         state = {"conversations": {"1": {"state": "await_symbol"}}}
@@ -332,6 +385,71 @@ class AddAssetFlowTests(unittest.TestCase):
         mock_send.assert_called_once()
         sent_text = mock_send.call_args[0][1]
         self.assertIn("100⭐", sent_text)
+
+    def test_debug_info_denies_non_admin(self):
+        class DummyMessage:
+            def __init__(self, chat_id):
+                self.chat_id = chat_id
+                self.replies = []
+
+            async def reply_text(self, text):
+                self.replies.append(text)
+
+        class DummyUser:
+            def __init__(self, user_id):
+                self.id = user_id
+
+        class DummyChat:
+            def __init__(self, chat_id):
+                self.id = chat_id
+
+        class DummyUpdate:
+            def __init__(self, chat_id, user_id):
+                self.effective_message = DummyMessage(chat_id)
+                self.effective_user = DummyUser(user_id)
+                self.effective_chat = DummyChat(chat_id)
+
+        update = DummyUpdate(111, 111)
+        asyncio.run(listen_start.debug_info(update, mock.Mock()))
+        self.assertEqual(update.effective_message.replies, [listen_start.DEBUG_NOT_ALLOWED_MESSAGE])
+
+    def test_debug_info_returns_payload_for_admin(self):
+        class DummyMessage:
+            def __init__(self, chat_id):
+                self.chat_id = chat_id
+                self.replies = []
+
+            async def reply_text(self, text):
+                self.replies.append(text)
+
+        class DummyUser:
+            def __init__(self, user_id):
+                self.id = user_id
+
+        class DummyChat:
+            def __init__(self, chat_id):
+                self.id = chat_id
+
+        class DummyUpdate:
+            def __init__(self, chat_id, user_id):
+                self.effective_message = DummyMessage(chat_id)
+                self.effective_user = DummyUser(user_id)
+                self.effective_chat = DummyChat(chat_id)
+
+        listen_start.ADMIN_CHAT_IDS = {1234}
+        update = DummyUpdate(1234, 1234)
+        payload = {"chat_id": 1234, "phone_number": "+1555", "is_subscribed": True}
+        expected = (
+            "اطلاعات شما در دیتابیس:\n"
+            "• chat_id: 1234\n"
+            "• phone_number: +1555\n"
+            "• subscribed: ✅"
+        )
+        with mock.patch.object(listen_start, "describe_backend", return_value="sqlite"), \
+            mock.patch.object(listen_start, "get_subscriber", return_value=payload):
+            asyncio.run(listen_start.debug_info(update, mock.Mock()))
+
+        self.assertEqual(update.effective_message.replies, [expected])
 
 
 if __name__ == "__main__":

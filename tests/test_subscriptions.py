@@ -2,9 +2,11 @@ import os
 import sqlite3
 import tempfile
 import unittest
+from unittest import mock
 from datetime import datetime, timezone
 from pathlib import Path
 
+import subscriptions
 from subscriptions import (
     add_to_watchlist,
     count_subscribers,
@@ -93,6 +95,42 @@ class SubscriptionTests(unittest.TestCase):
         self.assertFalse(entry_again["awaiting_contact"])
         self.assertIsNone(entry_again["contact_prompted_at"])
 
+    def test_upsert_bools_postgres(self):
+        executed: list[tuple[str, tuple]] = []
+
+        def fake_execute(conn, query, params=(), *, fetchone=False, fetchall=False):
+            executed.append((query, params, fetchone, fetchall))
+            if fetchone:
+                return None
+            return 1
+
+        with mock.patch.object(subscriptions, "_USE_POSTGRES", True), mock.patch.object(
+            subscriptions, "_execute", side_effect=fake_execute
+        ):
+            changed, entry = subscriptions._upsert_subscriber_with_conn(  # type: ignore[attr-defined]
+                object(),
+                "777",
+                phone_normalised="+1777",
+                first_name="Test",
+                last_name="Case",
+                username="tester",
+                is_subscribed=1,
+                awaiting_contact=0,
+                contact_prompted_at=subscriptions._UNSET,
+            )
+
+        self.assertTrue(changed)
+        self.assertTrue(entry["is_subscribed"])
+        self.assertFalse(entry["awaiting_contact"])
+        self.assertGreaterEqual(len(executed), 2)
+        insert_params = executed[1][1]
+        insert_statement = " ".join(executed[1][0].split())
+        self.assertIn("chat_id", insert_statement)
+        self.assertIsInstance(insert_params[5], bool)
+        self.assertIsInstance(insert_params[6], bool)
+        self.assertTrue(insert_params[5])
+        self.assertFalse(insert_params[6])
+
     def test_db_constraints_exist(self):
         upsert_subscriber(1, phone_number="+111", path=self.db_path)
         with sqlite3.connect(self.db_path) as conn:
@@ -104,7 +142,7 @@ class SubscriptionTests(unittest.TestCase):
 
             info = conn.execute("PRAGMA table_info('subscribers')").fetchall()
             pk_columns = [row[1] for row in info if row[5]]
-            self.assertIn("tg_user_id", pk_columns)
+            self.assertIn("chat_id", pk_columns)
 
         self.assertEqual(count_subscribers(path=self.db_path, only_active=True), 1)
 

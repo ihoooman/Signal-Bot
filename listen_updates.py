@@ -3,12 +3,37 @@
 """Long-polling runner that reuses ``listen_start`` helpers with persistence."""
 
 import asyncio
+import logging
 import threading
 from typing import Optional
 
 import listen_start
 
 __all__ = ["load_offset", "save_offset", "main", "run_polling_main"]
+
+LOGGER = logging.getLogger("signal_bot.listen_updates")
+REGISTER_LOGGER = logging.getLogger("register")
+
+KNOWN_COMMANDS = frozenset({"/start", "/menu", "/get", "/add", "/remove", "/debug"})
+
+
+async def on_unknown(update, context) -> None:
+    message = getattr(update, "effective_message", None)
+    if message is None:
+        return
+    text = getattr(message, "text", None)
+    if isinstance(text, str):
+        command = text.strip().split()[0] if text.strip() else ""
+        if command:
+            normalized = command.split("@", 1)[0].lower()
+            if normalized in KNOWN_COMMANDS:
+                LOGGER.debug(
+                    "Ignoring known command in unknown handler: command=%s", command
+                )
+                return
+    chat = getattr(update, "effective_chat", None)
+    LOGGER.info("Routing unknown command for chat_id=%s", getattr(chat, "id", None))
+    await message.reply_text(listen_start.UNKNOWN_COMMAND_MESSAGE)
 
 
 def load_offset() -> Optional[int]:
@@ -418,12 +443,54 @@ class _LegacyPollingWorker:
             self._subs_changed = False
 
 
+def _register_handlers(
+    app,
+    dispatch_callback,
+    *,
+    command_handler_cls=None,
+    message_handler_cls=None,
+    type_handler_cls=None,
+    command_filter=None,
+    update_cls=None,
+):
+    if getattr(app, "_handlers_registered", False):
+        LOGGER.debug("Skipping handler registration on %r; already configured", app)
+        return
+
+    if (
+        command_handler_cls is None
+        or message_handler_cls is None
+        or type_handler_cls is None
+        or command_filter is None
+        or update_cls is None
+    ):
+        from telegram import Update
+        from telegram.ext import CommandHandler, MessageHandler, TypeHandler, filters
+
+        command_handler_cls = CommandHandler
+        message_handler_cls = MessageHandler
+        type_handler_cls = TypeHandler
+        command_filter = filters.COMMAND
+        update_cls = Update
+
+    app.add_handler(command_handler_cls("debug", listen_start.debug_info))
+    REGISTER_LOGGER.info("/debug handler registered")
+    app.add_handler(type_handler_cls(update_cls, dispatch_callback), group=1)
+    REGISTER_LOGGER.info("/start handler registered")
+    REGISTER_LOGGER.info("/menu handler registered")
+    REGISTER_LOGGER.info("/get handler registered")
+    app.add_handler(message_handler_cls(command_filter, on_unknown), group=2)
+    REGISTER_LOGGER.info("unknown handler registered LAST")
+
+    setattr(app, "_handlers_registered", True)
+
+
 def run_polling_main() -> None:
     """Start the python-telegram-bot polling loop."""
 
     try:
         from telegram import Update
-        from telegram.ext import ApplicationBuilder, ContextTypes, TypeHandler
+        from telegram.ext import ApplicationBuilder, ContextTypes
     except ModuleNotFoundError as exc:  # pragma: no cover - missing dependency
         raise RuntimeError("python-telegram-bot is required for polling") from exc
 
@@ -432,6 +499,10 @@ def run_polling_main() -> None:
     worker = _LegacyPollingWorker()
 
     async def _dispatch(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        message = getattr(update, "effective_message", None)
+        text = getattr(message, "text", None) if message else None
+        if isinstance(text, str) and text.strip().lower().startswith("/debug"):
+            return
         await worker.process_update(update)
 
     app = (
@@ -440,5 +511,5 @@ def run_polling_main() -> None:
         .concurrent_updates(False)
         .build()
     )
-    app.add_handler(TypeHandler(Update, _dispatch))
+    _register_handlers(app, _dispatch)
     app.run_polling(drop_pending_updates=True, stop_signals=None)

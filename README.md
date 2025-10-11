@@ -96,6 +96,9 @@ python migrate_db.py
 
 The CLI prints the resolved backend, ensures the schema exists, migrates legacy data, and reports the current subscriber count. You can pass `--path /tmp/test.sqlite3` to probe an alternate SQLite file during local testing.
 
+### PostgreSQL booleans
+`subscribers.is_subscribed` and `subscribers.awaiting_contact` are stored as real PostgreSQL booleans. All write paths coerce values such as `0/1`, `"true"/"false"`, and `None` into proper `True`/`False` flags before binding parameters, and the CLI migration (`python migrate_db.py`) upgrades legacy integer columns via `ALTER TABLE … USING …` before inserting a throwaway record to verify the conversion.
+
 ## Telegram Stars donations
 - Tap "💖 دونیت با استارز / Donate with Stars" to pick a tier from `DONATION_TIERS` or enter a custom value in Stars.
 - Payments are handled entirely inside Telegram via native invoices (digital goods). If the client cannot process Stars payments, the bot replies with a friendly fallback message.

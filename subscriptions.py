@@ -34,9 +34,52 @@ _USE_POSTGRES = bool(_DB_URL)
 _PG_POOL: SimpleConnectionPool | None = None
 _PG_SCHEMA_READY = False
 _POSTGRES_MIGRATED = False
+_POSTGRES_BOOL_MIGRATED = False
 _SQLITE_SCHEMA_READY: dict[str, bool] = {}
 _SQLITE_MIGRATED: dict[str, bool] = {}
 _BACKEND_LOGGED = False
+
+_EXPECTED_SUBSCRIBER_COLUMNS = (
+    "chat_id",
+    "phone_e164",
+    "first_name",
+    "last_name",
+    "username",
+    "is_subscribed",
+    "awaiting_contact",
+    "contact_prompted_at",
+    "subscribed_at",
+    "updated_at",
+    "last_summary_at",
+)
+
+_SQLITE_COLUMN_TYPES: Dict[str, str] = {
+    "chat_id": "TEXT",
+    "phone_e164": "TEXT",
+    "first_name": "TEXT",
+    "last_name": "TEXT",
+    "username": "TEXT",
+    "is_subscribed": "INTEGER",
+    "awaiting_contact": "INTEGER",
+    "contact_prompted_at": "TEXT",
+    "subscribed_at": "TEXT",
+    "updated_at": "TEXT",
+    "last_summary_at": "TEXT",
+}
+
+_POSTGRES_COLUMN_TYPES: Dict[str, str] = {
+    "chat_id": "TEXT",
+    "phone_e164": "TEXT",
+    "first_name": "TEXT",
+    "last_name": "TEXT",
+    "username": "TEXT",
+    "is_subscribed": "BOOLEAN",
+    "awaiting_contact": "BOOLEAN",
+    "contact_prompted_at": "TIMESTAMPTZ",
+    "subscribed_at": "TIMESTAMPTZ",
+    "updated_at": "TIMESTAMPTZ",
+    "last_summary_at": "TIMESTAMPTZ",
+}
 
 _SQL_INTEGRITY_ERRORS: tuple[type[Exception], ...]
 if psycopg2 is not None:
@@ -107,6 +150,47 @@ def _normalise_phone_number(phone_number: str) -> str:
     return "+" + digits
 
 
+def _coerce_boolish(
+    value: Any,
+    *,
+    allow_none: bool = False,
+    default: bool = False,
+) -> bool | None:
+    """Normalise ``value`` into ``bool`` or ``None``.
+
+    Accepts integers, strings, and truthy / falsy sentinels so callers can pass
+    payloads coming from Telegram updates (which frequently encode booleans as
+    ``0``/``1``) without leaking integers into psycopg2 parameter binding.
+    """
+
+    if value is None:
+        return None if allow_none else default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        if value in (0, 1):
+            return bool(value)
+        return bool(value)
+    if isinstance(value, str):
+        token = value.strip().lower()
+        if not token:
+            return None if allow_none else default
+        if token in {"true", "t", "1", "yes", "y", "on"}:
+            return True
+        if token in {"false", "f", "0", "no", "n", "off"}:
+            return False
+        return bool(token)
+    return bool(value)
+
+
+def _mask_phone(phone_number: str) -> str:
+    if not phone_number:
+        return ""
+    if len(phone_number) <= 6:
+        return phone_number
+    return f"{phone_number[:4]}…{phone_number[-2:]}"
+
+
 def _mask_dsn(dsn: str) -> str:
     try:
         parsed = urlparse(dsn)
@@ -128,7 +212,7 @@ def _sql(query: str) -> str:
 
 @contextmanager
 def _connect(path: Path | None = None) -> Iterator[Any]:
-    global _PG_POOL, _PG_SCHEMA_READY, _POSTGRES_MIGRATED, _BACKEND_LOGGED
+    global _PG_POOL, _PG_SCHEMA_READY, _POSTGRES_MIGRATED, _POSTGRES_BOOL_MIGRATED, _BACKEND_LOGGED
 
     if _USE_POSTGRES:
         if SimpleConnectionPool is None or psycopg2 is None or pg_extras is None:  # pragma: no cover
@@ -144,6 +228,9 @@ def _connect(path: Path | None = None) -> Iterator[Any]:
             if not _PG_SCHEMA_READY:
                 _ensure_schema_postgres(conn)
                 _PG_SCHEMA_READY = True
+            if not _POSTGRES_BOOL_MIGRATED:
+                _migrate_postgres_boolean_columns(conn)
+                _POSTGRES_BOOL_MIGRATED = True
             if not _POSTGRES_MIGRATED:
                 _migrate_legacy_sources(conn)
                 _POSTGRES_MIGRATED = True
@@ -184,7 +271,7 @@ def _ensure_schema_sqlite(conn: sqlite3.Connection) -> None:
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS subscribers (
-            tg_user_id TEXT PRIMARY KEY,
+            chat_id TEXT PRIMARY KEY,
             phone_e164 TEXT,
             first_name TEXT,
             last_name TEXT,
@@ -193,14 +280,9 @@ def _ensure_schema_sqlite(conn: sqlite3.Connection) -> None:
             awaiting_contact INTEGER NOT NULL DEFAULT 0,
             contact_prompted_at TEXT,
             subscribed_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL
+            updated_at TEXT NOT NULL,
+            last_summary_at TEXT
         )
-        """
-    )
-    conn.execute(
-        """
-        CREATE INDEX IF NOT EXISTS idx_subscribers_phone_e164
-        ON subscribers(phone_e164)
         """
     )
     conn.execute(
@@ -249,40 +331,54 @@ def _ensure_schema_sqlite(conn: sqlite3.Connection) -> None:
     info_rows = conn.execute("PRAGMA table_info('subscribers')").fetchall()
     existing_columns = {row["name"] if isinstance(row, sqlite3.Row) else row[1] for row in info_rows}
 
-    migrations: List[Tuple[str, str]] = [
-        ("phone_e164", "ALTER TABLE subscribers ADD COLUMN phone_e164 TEXT"),
-        ("first_name", "ALTER TABLE subscribers ADD COLUMN first_name TEXT"),
-        ("last_name", "ALTER TABLE subscribers ADD COLUMN last_name TEXT"),
-        ("username", "ALTER TABLE subscribers ADD COLUMN username TEXT"),
-        (
-            "is_subscribed",
-            "ALTER TABLE subscribers ADD COLUMN is_subscribed INTEGER NOT NULL DEFAULT 1",
-        ),
-        (
-            "awaiting_contact",
-            "ALTER TABLE subscribers ADD COLUMN awaiting_contact INTEGER NOT NULL DEFAULT 0",
-        ),
-        ("contact_prompted_at", "ALTER TABLE subscribers ADD COLUMN contact_prompted_at TEXT"),
-        ("subscribed_at", "ALTER TABLE subscribers ADD COLUMN subscribed_at TEXT"),
-        ("updated_at", "ALTER TABLE subscribers ADD COLUMN updated_at TEXT"),
-    ]
+    if "tg_user_id" in existing_columns and "chat_id" not in existing_columns:
+        LOGGER.warning("Renaming column tg_user_id to chat_id (SQLite)")
+        conn.execute("ALTER TABLE subscribers RENAME COLUMN tg_user_id TO chat_id")
+        existing_columns.remove("tg_user_id")
+        existing_columns.add("chat_id")
+
+    migrations: List[Tuple[str, str]] = []
+    for column, ddl_type in _SQLITE_COLUMN_TYPES.items():
+        if column == "chat_id":
+            continue
+        default_clause = ""
+        if column == "is_subscribed":
+            default_clause = " NOT NULL DEFAULT 1"
+        elif column == "awaiting_contact":
+            default_clause = " NOT NULL DEFAULT 0"
+        elif column in {"subscribed_at", "updated_at"}:
+            default_clause = ""
+        migrations.append(
+            (
+                column,
+                f"ALTER TABLE subscribers ADD COLUMN {column} {ddl_type}{default_clause}",
+            )
+        )
 
     for column_name, ddl in migrations:
         if column_name not in existing_columns:
             LOGGER.warning("Adding missing column %s to subscribers table", column_name)
             conn.execute(ddl)
+            existing_columns.add(column_name)
             if column_name in {"subscribed_at", "updated_at"}:
                 conn.execute(
                     f"UPDATE subscribers SET {column_name} = ? WHERE {column_name} IS NULL",
                     (_now_iso(),),
                 )
 
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_subscribers_phone_e164
+        ON subscribers(phone_e164)
+        """
+    )
+
 
 def _ensure_schema_postgres(conn: Any) -> None:
     statements = [
         """
         CREATE TABLE IF NOT EXISTS subscribers (
-            tg_user_id TEXT PRIMARY KEY,
+            chat_id TEXT PRIMARY KEY,
             phone_e164 TEXT,
             first_name TEXT,
             last_name TEXT,
@@ -291,7 +387,8 @@ def _ensure_schema_postgres(conn: Any) -> None:
             awaiting_contact BOOLEAN NOT NULL DEFAULT FALSE,
             contact_prompted_at TIMESTAMPTZ,
             subscribed_at TIMESTAMPTZ NOT NULL,
-            updated_at TIMESTAMPTZ NOT NULL
+            updated_at TIMESTAMPTZ NOT NULL,
+            last_summary_at TIMESTAMPTZ
         )
         """,
         """
@@ -336,6 +433,98 @@ def _ensure_schema_postgres(conn: Any) -> None:
         for stmt in statements:
             cur.execute(stmt)
 
+    _postgres_sync_subscriber_columns(conn)
+
+
+def _postgres_fetch_columns(conn: Any) -> Dict[str, str]:
+    query = """
+        SELECT column_name, data_type
+        FROM information_schema.columns
+        WHERE table_schema = current_schema()
+          AND table_name = 'subscribers'
+    """
+    with conn.cursor() as cur:
+        cur.execute(query)
+        rows = cur.fetchall()
+    columns: Dict[str, str] = {}
+    for name, dtype in rows:
+        if isinstance(name, str):
+            columns[name] = dtype.lower() if isinstance(dtype, str) else str(dtype)
+    return columns
+
+
+def _postgres_sync_subscriber_columns(conn: Any) -> None:
+    columns = _postgres_fetch_columns(conn)
+
+    if "chat_id" not in columns and "tg_user_id" in columns:
+        with conn.cursor() as cur:
+            cur.execute("ALTER TABLE subscribers RENAME COLUMN tg_user_id TO chat_id")
+        LOGGER.info("Renamed column tg_user_id to chat_id (PostgreSQL)")
+        columns["chat_id"] = columns.pop("tg_user_id")
+
+    additions: List[str] = []
+
+    for column, ddl_type in _POSTGRES_COLUMN_TYPES.items():
+        if column not in columns:
+            additions.append(
+                f"ALTER TABLE subscribers ADD COLUMN IF NOT EXISTS {column} {ddl_type}"
+            )
+
+    if additions:
+        with conn.cursor() as cur:
+            for ddl in additions:
+                cur.execute(ddl)
+                LOGGER.info("Applied migration step: %s", ddl)
+
+
+def _postgres_column_type(conn: Any, column: str) -> str | None:
+    query = """
+        SELECT data_type
+        FROM information_schema.columns
+        WHERE table_schema = current_schema()
+          AND table_name = 'subscribers'
+          AND column_name = %s
+    """
+    with conn.cursor() as cur:
+        cur.execute(query, (column,))
+        row = cur.fetchone()
+    if not row:
+        return None
+    value = row[0]
+    if isinstance(value, str):
+        return value.lower()
+    return None
+
+
+def _migrate_postgres_boolean_columns(conn: Any) -> None:
+    columns = ("is_subscribed", "awaiting_contact")
+    needs_migration = []
+    for column in columns:
+        column_type = _postgres_column_type(conn, column)
+        if column_type and column_type not in {"boolean", "bool"}:
+            needs_migration.append(column)
+    if not needs_migration:
+        return
+
+    statements = [
+        f"""
+        ALTER TABLE subscribers
+        ALTER COLUMN {column} TYPE BOOLEAN
+        USING (
+            CASE
+                WHEN {column} IN (1, '1', TRUE, 't') THEN TRUE
+                ELSE FALSE
+            END
+        )
+        """
+        for column in needs_migration
+    ]
+
+    with conn.cursor() as cur:
+        for stmt in statements:
+            cur.execute(stmt)
+    LOGGER.info("Migrated boolean columns in subscribers table")
+
 
 def _execute(conn: Any, query: str, params: Tuple[Any, ...] = (), *, fetchone: bool = False, fetchall: bool = False):
     statement = _sql(query)
@@ -359,8 +548,15 @@ def _execute(conn: Any, query: str, params: Tuple[Any, ...] = (), *, fetchone: b
 
 
 def _row_to_subscriber(row: Any) -> Subscriber:
+    if isinstance(row, dict):
+        chat_value = row.get("chat_id")
+        if chat_value is None and "tg_user_id" in row:
+            chat_value = row.get("tg_user_id")
+    else:
+        keys = row.keys()
+        chat_value = row["chat_id"] if "chat_id" in keys else row["tg_user_id"]
     return {
-        "chat_id": row["tg_user_id"],
+        "chat_id": chat_value,
         "phone_number": (row["phone_e164"] or "") if row["phone_e164"] is not None else "",
         "first_name": row["first_name"] or "",
         "last_name": row["last_name"] or "",
@@ -377,7 +573,7 @@ def load_subscribers(path: Path | None = None) -> List[Subscriber]:
     with _connect(path) as conn:
         rows = _execute(
             conn,
-            "SELECT tg_user_id, phone_e164, first_name, last_name, username, is_subscribed, awaiting_contact, contact_prompted_at, subscribed_at, updated_at FROM subscribers ORDER BY subscribed_at",
+            "SELECT chat_id, phone_e164, first_name, last_name, username, is_subscribed, awaiting_contact, contact_prompted_at, subscribed_at, updated_at FROM subscribers ORDER BY subscribed_at",
             fetchall=True,
         )
     return [_row_to_subscriber(row) for row in rows]
@@ -391,7 +587,7 @@ def get_subscriber(chat_id: int | str, *, path: Path | None = None) -> Subscribe
     with _connect(path) as conn:
         row = _execute(
             conn,
-            "SELECT tg_user_id, phone_e164, first_name, last_name, username, is_subscribed, awaiting_contact, contact_prompted_at, subscribed_at, updated_at FROM subscribers WHERE tg_user_id = ?",
+            "SELECT chat_id, phone_e164, first_name, last_name, username, is_subscribed, awaiting_contact, contact_prompted_at, subscribed_at, updated_at FROM subscribers WHERE chat_id = ?",
             (chat_id_str,),
             fetchone=True,
         )
@@ -406,27 +602,41 @@ def _upsert_subscriber_with_conn(
     first_name: str,
     last_name: str,
     username: str,
-    is_subscribed: bool,
-    awaiting_contact: bool | object,
+    is_subscribed: Any,
+    awaiting_contact: Any,
     contact_prompted_at: datetime | str | None | object,
 ) -> Tuple[bool, Subscriber]:
     row = _execute(
         conn,
-        "SELECT phone_e164, first_name, last_name, username, is_subscribed, awaiting_contact, contact_prompted_at, subscribed_at, updated_at FROM subscribers WHERE tg_user_id = ?",
+        "SELECT phone_e164, first_name, last_name, username, is_subscribed, awaiting_contact, contact_prompted_at, subscribed_at, updated_at FROM subscribers WHERE chat_id = ?",
         (chat_id_str,),
         fetchone=True,
     )
 
+    backend = "postgresql" if _USE_POSTGRES else "sqlite"
     now = _now_iso()
-    awaiting_value = bool(awaiting_contact) if awaiting_contact is not _UNSET else False
+    is_subscribed_bool = _coerce_boolish(is_subscribed, default=True)
+    awaiting_coerced: bool | None
+    if awaiting_contact is _UNSET:
+        awaiting_coerced = None
+    else:
+        awaiting_coerced = _coerce_boolish(awaiting_contact, allow_none=True)
     prompted_value = _normalise_timestamp(contact_prompted_at) if contact_prompted_at is not _UNSET else None
-    masked_phone = phone_normalised if len(phone_normalised) <= 6 else f"{phone_normalised[:4]}…{phone_normalised[-2:]}"
+    phone_for_log = phone_normalised or (row["phone_e164"] if row else "") or ""
+    awaiting_for_log = (
+        awaiting_coerced
+        if awaiting_coerced is not None
+        else (bool(row["awaiting_contact"]) if row else False)
+    )
+    masked_phone = _mask_phone(phone_for_log)
     LOGGER.info(
-        "Upserting subscriber chat_id=%s phone=%s subscribed=%s awaiting=%s",
+        "Upserting subscriber backend=%s table=%s chat_id=%s phone=%s subscribed=%s awaiting=%s",
+        backend,
+        "subscribers",
         chat_id_str,
         masked_phone,
-        bool(is_subscribed),
-        awaiting_value,
+        is_subscribed_bool,
+        awaiting_for_log,
     )
 
     if row is None:
@@ -436,18 +646,19 @@ def _upsert_subscriber_with_conn(
             "first_name": first_name,
             "last_name": last_name,
             "username": username,
-            "is_subscribed": bool(is_subscribed),
-            "awaiting_contact": awaiting_value,
+            "is_subscribed": bool(is_subscribed_bool),
+            "awaiting_contact": awaiting_for_log,
             "contact_prompted_at": prompted_value,
             "subscribed_at": now,
             "updated_at": now,
         }
+        awaiting_insert = awaiting_for_log if isinstance(awaiting_for_log, bool) else False
         _execute(
             conn,
             """
             INSERT INTO subscribers (
-                tg_user_id, phone_e164, first_name, last_name, username, is_subscribed, awaiting_contact, contact_prompted_at, subscribed_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                chat_id, phone_e164, first_name, last_name, username, is_subscribed, awaiting_contact, contact_prompted_at, subscribed_at, updated_at, last_summary_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 chat_id_str,
@@ -455,14 +666,19 @@ def _upsert_subscriber_with_conn(
                 first_name or None,
                 last_name or None,
                 username or None,
-                1 if is_subscribed else 0,
-                1 if awaiting_value else 0,
+                bool(is_subscribed_bool),
+                bool(awaiting_insert),
                 prompted_value,
                 now,
                 now,
+                None,
             ),
         )
-        LOGGER.info("Inserted new subscriber chat_id=%s", chat_id_str)
+        LOGGER.info(
+            "Subscriber upsert succeeded backend=%s action=insert chat_id=%s",
+            backend,
+            chat_id_str,
+        )
         return True, subscriber
 
     existing = {
@@ -492,13 +708,13 @@ def _upsert_subscriber_with_conn(
     if existing["username"] != username:
         new_values["username"] = username
         changed = True
-    if existing["is_subscribed"] != bool(is_subscribed):
-        new_values["is_subscribed"] = bool(is_subscribed)
+    if existing["is_subscribed"] != bool(is_subscribed_bool):
+        new_values["is_subscribed"] = bool(is_subscribed_bool)
         changed = True
     if awaiting_contact is not _UNSET:
-        awaiting_bool = bool(awaiting_contact)
-        if existing["awaiting_contact"] != awaiting_bool:
-            new_values["awaiting_contact"] = awaiting_bool
+        awaiting_bool = awaiting_coerced if awaiting_coerced is not None else False
+        if existing["awaiting_contact"] != bool(awaiting_bool):
+            new_values["awaiting_contact"] = bool(awaiting_bool)
             changed = True
     if contact_prompted_at is not _UNSET:
         normalised_prompt = _normalise_timestamp(contact_prompted_at)
@@ -512,22 +728,31 @@ def _upsert_subscriber_with_conn(
             """
             UPDATE subscribers
             SET phone_e164 = ?, first_name = ?, last_name = ?, username = ?, is_subscribed = ?, awaiting_contact = ?, contact_prompted_at = ?, updated_at = ?
-            WHERE tg_user_id = ?
+            WHERE chat_id = ?
             """,
             (
                 new_values["phone_number"] or None,
                 new_values["first_name"] or None,
                 new_values["last_name"] or None,
                 new_values["username"] or None,
-                1 if new_values["is_subscribed"] else 0,
-                1 if new_values["awaiting_contact"] else 0,
+                bool(new_values["is_subscribed"]),
+                bool(new_values["awaiting_contact"]),
                 new_values["contact_prompted_at"],
                 new_values["updated_at"],
                 chat_id_str,
             ),
         )
-        LOGGER.info("Updated subscriber chat_id=%s", chat_id_str)
+        LOGGER.info(
+            "Subscriber upsert succeeded backend=%s action=update chat_id=%s",
+            backend,
+            chat_id_str,
+        )
         return True, new_values
+    LOGGER.info(
+        "Subscriber upsert no-op backend=%s chat_id=%s",
+        backend,
+        chat_id_str,
+    )
     return False, existing
 
 
@@ -570,19 +795,22 @@ def get_active_chat_ids(path: Path | None = None) -> List[str]:
     with _connect(path) as conn:
         rows = _execute(
             conn,
-            "SELECT tg_user_id FROM subscribers WHERE is_subscribed = 1 ORDER BY subscribed_at",
+            "SELECT chat_id FROM subscribers WHERE is_subscribed = ? ORDER BY subscribed_at",
+            (True,),
             fetchall=True,
         )
-    return [row["tg_user_id"] for row in rows]
+    return [row["chat_id"] for row in rows]
 
 
 def count_subscribers(*, path: Path | None = None, only_active: bool = False) -> int:
     query = "SELECT COUNT(1) AS total FROM subscribers"
+    params: Tuple[Any, ...] = ()
     if only_active:
-        query += " WHERE is_subscribed = 1"
+        query += " WHERE is_subscribed = ?"
+        params = (True,)
 
     with _connect(path) as conn:
-        row = _execute(conn, query, fetchone=True)
+        row = _execute(conn, query, params, fetchone=True)
     if not row:
         return 0
     if isinstance(row, dict):
@@ -800,6 +1028,29 @@ def describe_backend(*, path: Path | None = None) -> str:
         return _mask_dsn(_DB_URL)
     db_path = _resolve_path(path)
     return str(db_path)
+
+
+def is_postgres_backend() -> bool:
+    return _USE_POSTGRES
+
+
+def expected_subscriber_columns() -> tuple[str, ...]:
+    return _EXPECTED_SUBSCRIBER_COLUMNS
+
+
+def subscriber_columns(*, path: Path | None = None) -> Dict[str, str]:
+    if _USE_POSTGRES:
+        with _connect(path) as conn:
+            return _postgres_fetch_columns(conn)
+    with _connect(path) as conn:
+        rows = conn.execute("PRAGMA table_info('subscribers')").fetchall()
+        columns: Dict[str, str] = {}
+        for row in rows:
+            name = row["name"] if isinstance(row, sqlite3.Row) else row[1]
+            dtype = row["type"] if isinstance(row, sqlite3.Row) else row[2]
+            if isinstance(name, str):
+                columns[name] = dtype or ""
+        return columns
 
 
 def _legacy_json_subscribers() -> List[dict]:
