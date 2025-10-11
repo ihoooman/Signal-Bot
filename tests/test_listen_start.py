@@ -13,6 +13,7 @@ os.environ.setdefault("TELEGRAM_BOT_TOKEN", "test-token")
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 
 import listen_start  # noqa: E402
+import subscriptions  # noqa: E402
 
 
 class AddAssetFlowTests(unittest.TestCase):
@@ -23,6 +24,7 @@ class AddAssetFlowTests(unittest.TestCase):
         self.prev_subs_file = listen_start.SUBS_FILE
         listen_start.SUBS_FILE = self.subs_path
         self.addCleanup(setattr, listen_start, "SUBS_FILE", self.prev_subs_file)
+        subscriptions.ensure_database_ready(path=self.subs_path)
         self.offset_path = Path(self.tmpdir.name) / "offset.txt"
         self.prev_offset = listen_start.OFFSET_FILE
         listen_start.OFFSET_FILE = self.offset_path
@@ -125,7 +127,7 @@ class AddAssetFlowTests(unittest.TestCase):
 
         mock_run.assert_called_once()
         mock_send.assert_called_once()
-        saved = json.loads(self.snapshot_path.read_text(encoding="utf-8"))
+        saved = subscriptions.load_latest_summary(path=self.subs_path)
         self.assertEqual(saved["counts"], summary["counts"])
 
     def test_get_uses_live_compute_when_no_snapshot(self):
@@ -139,7 +141,7 @@ class AddAssetFlowTests(unittest.TestCase):
         mock_run.assert_called_once()
         mock_send.assert_called_once()
         self.assertEqual(result["counts"], summary["counts"])
-        self.assertTrue(self.snapshot_path.exists())
+        self.assertIsNotNone(subscriptions.load_latest_summary(path=self.subs_path))
 
     def test_get_uses_snapshot_when_fresh(self):
         payload = self._sample_summary()
@@ -160,7 +162,7 @@ class AddAssetFlowTests(unittest.TestCase):
             "highlights": [],
             "per_user_overrides": False,
         }
-        self.snapshot_path.write_text(json.dumps(payload), encoding="utf-8")
+        subscriptions.save_summary(payload, path=self.subs_path)
 
         class FakeUpdate:
             def __init__(self, data):

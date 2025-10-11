@@ -54,7 +54,7 @@ CRYPTOCOMPARE_API_KEY=cryptocompare-api-key (optional)
 
 Tips:
 - Set `ENV_FILE` in the environment to point at a custom config file if you deploy outside the repo root.
-- `SUBSCRIBERS_DB_PATH` controls where the SQLite-backed subscriber registry lives. Set it to a persistent volume in production deployments. Legacy `SUBSCRIBERS_PATH` values are treated as the same override for backwards compatibility.
+- `SUBSCRIBERS_DB_PATH` controls where the SQLite-backed subscriber registry lives when `DB_URL` is not set. Set it to a persistent volume in production deployments. Legacy `SUBSCRIBERS_PATH` values are treated as the same override for backwards compatibility.
 - When the database contains at least one active chat id, the bot will broadcast to all of them. `TELEGRAM_CHAT_ID` is used only as a fallback or for smoke tests.
 
 ## Smoke test your credentials
@@ -69,19 +69,37 @@ Capture `/start` messages, request phone numbers, and maintain your subscriber l
 python listen_start.py
 ```
 Behind the scenes:
-- `listen_start.py` now replies to `/start` with a one-tap "📱 ارسال شماره من" button. Users become subscribed only after sharing their Telegram phone number, which is stored in a SQLite database alongside their chat id.
+- `listen_start.py` now replies to `/start` with a one-tap "📱 ارسال شماره من" button. Users become subscribed only after sharing their Telegram phone number, which is stored in the subscriber database (PostgreSQL when `DB_URL` is set, otherwise SQLite) alongside their chat id.
 - `listen_updates.py` is a thin wrapper around `listen_start.py` for backwards compatibility.
 - `data/offset.txt` prevents duplicate processing and is updated after every batch so repeated Telegram fetches stay idempotent. Keep both files private; they contain user identifiers.
 - Override the storage path with `SUBSCRIBERS_DB_PATH` when you want to place the database outside the repository (e.g., on a persistent volume). The schema enforces a unique Telegram user id and an index on phone numbers for quick lookups.
 - After a contact is registered the bot sends an inline menu with four bilingual buttons: "📬 دریافت فوری / Get updates now" replays the most recent cached BUY / SELL / NO ACTION snapshot when it is still fresh, otherwise it triggers a one-off live evaluation, refreshes `data/last_summary.json`, and highlights any emergencies captured during that run. "➕ افزودن ارز / Add asset" lets the user extend their personal watchlist (default quote `USDT` unless they type another quote such as `SOLUSDC`), "🗑️ حذف ارز / Remove asset" removes pairs from the per-user watchlist with confirmation prompts and pagination when needed, and "💖 دونیت با استارز / Donate with Stars" opens the Telegram Stars drawer with preconfigured tiers (default `DONATION_TIERS`) plus a custom amount prompt. New subscribers that have not customised their watchlist yet are automatically seeded with the comma-separated symbols from `DEFAULT_ASSETS` so `/get` and the inline shortcut always return something meaningful.
-- Each selection is stored in the SQLite database under `user_watchlist (user_id, symbol_pair, created_at)` with uniqueness enforced per user, so the two-hour emergency sweep, four-hour summaries, and on-demand updates always include custom pairs.
+- Each selection is stored in the subscriber database under `user_watchlist (user_id, symbol_pair, created_at)` with uniqueness enforced per user, so the two-hour emergency sweep, four-hour summaries, and on-demand updates always include custom pairs.
 - Users can send `/menu` at any time to re-open the bilingual inline keyboard, `/get` to receive the latest cached snapshot instantly, `/donate` to open the Stars tiers directly, `/help` for a quick list of commands, or `/cancel` to abandon the add-asset flow.
 - The donation drawer uses Telegram's native Stars invoices (`currency=XTR`, no provider token). `/terms` provides a short terms notice, `/paysupport` explains how to reach payment support, and admins listed in `ADMIN_CHAT_IDS` can review the last donations via `/donations` or request a refund with `/refund <telegram_payment_charge_id>`.
+
+## Using PostgreSQL (Neon)
+
+Set `DB_URL` when you want to store subscribers and summary snapshots in PostgreSQL instead of the local SQLite file. The value should be a standard psycopg2-compatible connection string, for example:
+
+```
+DB_URL=postgresql://bot_user:superSecret@ep-iced-forest-123456.us-east-2.aws.neon.tech/neondb?sslmode=require
+```
+
+When the variable is present the bot automatically establishes a connection pool (with SSL if requested), creates the required tables (`subscribers`, `summaries`, `user_watchlist`, `donations`), and migrates any existing `subscribers.json`, `subscribers.sqlite3`, or `data/last_summary.json` content into PostgreSQL. If `DB_URL` is absent the bot falls back to a local SQLite file at `SUBSCRIBERS_DB_PATH` (or `subscribers.sqlite3` next to the codebase).
+
+To verify connectivity and trigger the migration manually run:
+
+```bash
+python migrate_db.py
+```
+
+The CLI prints the resolved backend, ensures the schema exists, migrates legacy data, and reports the current subscriber count. You can pass `--path /tmp/test.sqlite3` to probe an alternate SQLite file during local testing.
 
 ## Telegram Stars donations
 - Tap "💖 دونیت با استارز / Donate with Stars" to pick a tier from `DONATION_TIERS` or enter a custom value in Stars.
 - Payments are handled entirely inside Telegram via native invoices (digital goods). If the client cannot process Stars payments, the bot replies with a friendly fallback message.
-- Successful payments are stored in the SQLite `donations` table along with the Telegram charge id so `/donations` can list the last 20 entries and totals.
+- Successful payments are stored in the subscriber database `donations` table along with the Telegram charge id so `/donations` can list the last 20 entries and totals.
 - Admins can issue `refundStarPayment` calls by running `/refund <telegram_payment_charge_id>` from an approved chat id (comma-separated in `ADMIN_CHAT_IDS`).
 
 ## Fire the signal engine
@@ -108,7 +126,7 @@ Behaviour:
 
 Secrets to configure:
 - `BOT_TOKEN` (Telegram bot token)
-- `DB_URL` (SQLAlchemy connection string if you store the SQLite database elsewhere; optional)
+- `DB_URL` (PostgreSQL connection string such as `postgresql://user:pass@host/db?sslmode=require`; enables Neon or any external database)
 - `ADMIN_CHAT_IDS`, `DONATION_TIERS`, and `TIMEZONE` override defaults if needed.
 - `GITHUB_TOKEN` is supplied automatically by Actions and is used to push the refreshed snapshot.
 - Optional: `TELEGRAM_CHAT_ID` and `CRYPTOCOMPARE_API_KEY` remain supported for fallback broadcasts and higher API rate limits.
@@ -135,11 +153,11 @@ Deploying the long-polling bot on [Render](https://render.com/) as a free Web Se
 - **Start Command:** `python run.py`
 - **Environment Variables:**
   - `BOT_TOKEN` (required)
-  - `DB_URL` (required when you use an external database; optional otherwise)
+  - `DB_URL` (PostgreSQL connection string for Neon or similar; omit to stay on SQLite)
   - `TIMEZONE=Asia/Tehran`
   - Optional overrides: `ADMIN_CHAT_IDS`, `DONATION_TIERS`
 
-Render injects the `PORT` variable at runtime; `health.py` binds to it so Render detects the listening socket while `listen_updates` continues long-polling in parallel. The SQLite database (`subscribers.sqlite3`) and `data/offset.txt` should live on a persistent disk if you need state across deploys. To minimise cold starts you can ping the health endpoint with a keep-alive service such as UptimeRobot.
+Render injects the `PORT` variable at runtime; `health.py` binds to it so Render detects the listening socket while `listen_updates` continues long-polling in parallel. When running without `DB_URL`, mount a persistent disk for the SQLite files (`subscribers.sqlite3`, `data/offset.txt`). When `DB_URL` points at Neon or another managed PostgreSQL instance the state survives deploys automatically. To minimise cold starts you can ping the health endpoint with a keep-alive service such as UptimeRobot.
 
 ## Security checklist
 - Never commit `.env`, `subscribers.json`, or `data/offset.txt`. They are already ignored in `.gitignore`.
