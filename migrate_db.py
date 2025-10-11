@@ -20,15 +20,31 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def verify_or_create(*, path: Path | None = None, logger: logging.Logger | None = None) -> dict:
+    logger = logger or logging.getLogger("migrate_db")
+    backend_label = "PostgreSQL" if subscriptions.is_postgres_backend() else "SQLite"
+    logger.info("Detected backend: %s", subscriptions.describe_backend(path=path))
+    logger.info("Verifying subscribers schema on %s", backend_label)
+
+    subscriptions.ensure_database_ready(path=path)
+    columns = subscriptions.subscriber_columns(path=path)
+    expected = subscriptions.expected_subscriber_columns()
+    missing = [column for column in expected if column not in columns]
+    if missing:
+        raise RuntimeError(
+            f"Missing subscribers columns after migration: {', '.join(sorted(missing))}"
+        )
+
+    logger.info("✅ subscribers schema verified/migrated successfully")
+    return columns
+
+
 def main() -> None:
     args = parse_args()
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     logger = logging.getLogger("migrate_db")
 
-    backend = subscriptions.describe_backend(path=args.path)
-    logger.info("Using subscriber backend: %s", backend)
-
-    subscriptions.ensure_database_ready(path=args.path)
+    verify_or_create(path=args.path, logger=logger)
     count = subscriptions.count_subscribers(path=args.path)
     logger.info("Subscriber rows present: %s", count)
 

@@ -12,12 +12,25 @@ import listen_start
 __all__ = ["load_offset", "save_offset", "main", "run_polling_main"]
 
 LOGGER = logging.getLogger("signal_bot.listen_updates")
+REGISTER_LOGGER = logging.getLogger("register")
+
+KNOWN_COMMANDS = frozenset({"/start", "/menu", "/get", "/add", "/remove", "/debug"})
 
 
 async def on_unknown(update, context) -> None:
     message = getattr(update, "effective_message", None)
     if message is None:
         return
+    text = getattr(message, "text", None)
+    if isinstance(text, str):
+        command = text.strip().split()[0] if text.strip() else ""
+        if command:
+            normalized = command.split("@", 1)[0].lower()
+            if normalized in KNOWN_COMMANDS:
+                LOGGER.debug(
+                    "Ignoring known command in unknown handler: command=%s", command
+                )
+                return
     chat = getattr(update, "effective_chat", None)
     LOGGER.info("Routing unknown command for chat_id=%s", getattr(chat, "id", None))
     await message.reply_text(listen_start.UNKNOWN_COMMAND_MESSAGE)
@@ -440,6 +453,10 @@ def _register_handlers(
     command_filter=None,
     update_cls=None,
 ):
+    if getattr(app, "_handlers_registered", False):
+        LOGGER.debug("Skipping handler registration on %r; already configured", app)
+        return
+
     if (
         command_handler_cls is None
         or message_handler_cls is None
@@ -457,9 +474,15 @@ def _register_handlers(
         update_cls = Update
 
     app.add_handler(command_handler_cls("debug", listen_start.debug_info))
-    LOGGER.info("/debug handler registered")
+    REGISTER_LOGGER.info("/debug handler registered")
     app.add_handler(type_handler_cls(update_cls, dispatch_callback), group=1)
+    REGISTER_LOGGER.info("/start handler registered")
+    REGISTER_LOGGER.info("/menu handler registered")
+    REGISTER_LOGGER.info("/get handler registered")
     app.add_handler(message_handler_cls(command_filter, on_unknown), group=2)
+    REGISTER_LOGGER.info("unknown handler registered LAST")
+
+    setattr(app, "_handlers_registered", True)
 
 
 def run_polling_main() -> None:

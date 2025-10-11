@@ -46,6 +46,7 @@ class ListenUpdatesTests(unittest.TestCase):
             update_cls="Update",
         )
 
+        self.assertTrue(getattr(app, "_handlers_registered", False))
         self.assertEqual(len(app.calls), 3)
         first, second, third = app.calls
         self.assertIsInstance(first[0], DummyCommandHandler)
@@ -55,6 +56,31 @@ class ListenUpdatesTests(unittest.TestCase):
         self.assertIsInstance(third[0], DummyMessageHandler)
         self.assertEqual(third[0].filter_value, "COMMAND")
         self.assertEqual(third[1], 2)
+
+    def test_register_handlers_is_idempotent(self):
+        app = DummyApp()
+        dispatch = object()
+
+        listen_updates._register_handlers(
+            app,
+            dispatch,
+            command_handler_cls=DummyCommandHandler,
+            message_handler_cls=DummyMessageHandler,
+            type_handler_cls=DummyTypeHandler,
+            command_filter="COMMAND",
+            update_cls="Update",
+        )
+        listen_updates._register_handlers(
+            app,
+            dispatch,
+            command_handler_cls=DummyCommandHandler,
+            message_handler_cls=DummyMessageHandler,
+            type_handler_cls=DummyTypeHandler,
+            command_filter="COMMAND",
+            update_cls="Update",
+        )
+
+        self.assertEqual(len(app.calls), 3)
 
     def test_on_unknown_replies_with_default_message(self):
         class DummyMessage:
@@ -73,6 +99,25 @@ class ListenUpdatesTests(unittest.TestCase):
         asyncio.run(listen_updates.on_unknown(update, object()))
 
         self.assertEqual(update.effective_message.replies, [listen_start.UNKNOWN_COMMAND_MESSAGE])
+
+    def test_on_unknown_ignores_known_commands(self):
+        class DummyMessage:
+            def __init__(self, text):
+                self.text = text
+                self.replies = []
+
+            async def reply_text(self, text):
+                self.replies.append(text)
+
+        class DummyUpdate:
+            def __init__(self, text):
+                self.effective_message = DummyMessage(text)
+                self.effective_chat = type("Chat", (), {"id": 7})()
+
+        update = DummyUpdate("/start")
+        asyncio.run(listen_updates.on_unknown(update, object()))
+
+        self.assertEqual(update.effective_message.replies, [])
 
 
 if __name__ == "__main__":

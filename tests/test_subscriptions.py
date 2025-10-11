@@ -124,6 +124,8 @@ class SubscriptionTests(unittest.TestCase):
         self.assertFalse(entry["awaiting_contact"])
         self.assertGreaterEqual(len(executed), 2)
         insert_params = executed[1][1]
+        insert_statement = " ".join(executed[1][0].split())
+        self.assertIn("chat_id", insert_statement)
         self.assertIsInstance(insert_params[5], bool)
         self.assertIsInstance(insert_params[6], bool)
         self.assertTrue(insert_params[5])
@@ -140,7 +142,7 @@ class SubscriptionTests(unittest.TestCase):
 
             info = conn.execute("PRAGMA table_info('subscribers')").fetchall()
             pk_columns = [row[1] for row in info if row[5]]
-            self.assertIn("tg_user_id", pk_columns)
+            self.assertIn("chat_id", pk_columns)
 
         self.assertEqual(count_subscribers(path=self.db_path, only_active=True), 1)
 

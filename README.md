@@ -99,6 +99,23 @@ The CLI prints the resolved backend, ensures the schema exists, migrates legacy 
 ### PostgreSQL booleans
 `subscribers.is_subscribed` and `subscribers.awaiting_contact` are stored as real PostgreSQL booleans. All write paths coerce values such as `0/1`, `"true"/"false"`, and `None` into proper `True`/`False` flags before binding parameters, and the CLI migration (`python migrate_db.py`) upgrades legacy integer columns via `ALTER TABLE … USING …` before inserting a throwaway record to verify the conversion.
 
+## Resolving GitHub merge conflicts
+If GitHub reports conflicts on files such as `listen_start.py`, `listen_updates.py`, `subscriptions.py`, or the associated tests,
+it means new commits have touched the same sections of code since this branch was created. Rebase (or merge) the latest `main`
+branch locally to bring those updates in, fix the conflicts, and push again:
+
+```bash
+git checkout work
+git fetch origin
+git rebase origin/main  # or: git merge origin/main
+# fix the conflicts shown by Git and stage the resolved files
+git add listen_start.py listen_updates.py subscriptions.py tests/test_listen_updates.py tests/test_subscriptions.py
+git rebase --continue    # or: git commit
+git push --force-with-lease
+```
+
+After the branch is updated without conflicts, GitHub will allow the pull request to merge cleanly.
+
 ## Telegram Stars donations
 - Tap "💖 دونیت با استارز / Donate with Stars" to pick a tier from `DONATION_TIERS` or enter a custom value in Stars.
 - Payments are handled entirely inside Telegram via native invoices (digital goods). If the client cannot process Stars payments, the bot replies with a friendly fallback message.

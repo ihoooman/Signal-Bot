@@ -32,6 +32,8 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
     from telegram import Update
     from telegram.ext import ContextTypes
 
+import migrate_db
+
 from signal_bot.services.symbol_resolver import ResolutionCandidate, ResolutionResult, resolve_instrument
 
 from subscriptions import (
@@ -52,6 +54,7 @@ from trigger_xrp_bot import render_compact_summary, run_summary_once, send_teleg
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO").upper())
 LOGGER = logging.getLogger("signal_bot.listen_start")
+
 
 REPO_ROOT = Path(__file__).resolve().parent
 for candidate in (os.getenv("ENV_FILE"), REPO_ROOT / ".env", Path("~/xrpbot/.env").expanduser()):
@@ -111,6 +114,9 @@ LEGACY_OFFSET_FILE = Path(os.getenv("LEGACY_OFFSET_FILE", str(ROOT / "offset.jso
 STATE_FILE = Path(os.getenv("CONVERSATION_STATE_PATH", str(ROOT / "conversation_state.json"))).expanduser()
 SNAPSHOT_PATH = Path(os.getenv("SNAPSHOT_PATH", str(ROOT / "data" / "last_summary.json"))).expanduser()
 SNAPSHOT_MAX_AGE = timedelta(hours=2)
+
+SCHEMA_LOGGER = logging.getLogger("signal_bot.schema")
+migrate_db.verify_or_create(path=SUBS_FILE, logger=SCHEMA_LOGGER)
 
 ALLOWED_UPDATES = ("message", "callback_query", "pre_checkout_query")
 
