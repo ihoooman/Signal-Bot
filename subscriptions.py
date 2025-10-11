@@ -34,6 +34,7 @@ _USE_POSTGRES = bool(_DB_URL)
 _PG_POOL: SimpleConnectionPool | None = None
 _PG_SCHEMA_READY = False
 _POSTGRES_MIGRATED = False
+_POSTGRES_BOOL_MIGRATED = False
 _SQLITE_SCHEMA_READY: dict[str, bool] = {}
 _SQLITE_MIGRATED: dict[str, bool] = {}
 _BACKEND_LOGGED = False
@@ -107,6 +108,47 @@ def _normalise_phone_number(phone_number: str) -> str:
     return "+" + digits
 
 
+def _coerce_boolish(
+    value: Any,
+    *,
+    allow_none: bool = False,
+    default: bool = False,
+) -> bool | None:
+    """Normalise ``value`` into ``bool`` or ``None``.
+
+    Accepts integers, strings, and truthy / falsy sentinels so callers can pass
+    payloads coming from Telegram updates (which frequently encode booleans as
+    ``0``/``1``) without leaking integers into psycopg2 parameter binding.
+    """
+
+    if value is None:
+        return None if allow_none else default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        if value in (0, 1):
+            return bool(value)
+        return bool(value)
+    if isinstance(value, str):
+        token = value.strip().lower()
+        if not token:
+            return None if allow_none else default
+        if token in {"true", "t", "1", "yes", "y", "on"}:
+            return True
+        if token in {"false", "f", "0", "no", "n", "off"}:
+            return False
+        return bool(token)
+    return bool(value)
+
+
+def _mask_phone(phone_number: str) -> str:
+    if not phone_number:
+        return ""
+    if len(phone_number) <= 6:
+        return phone_number
+    return f"{phone_number[:4]}…{phone_number[-2:]}"
+
+
 def _mask_dsn(dsn: str) -> str:
     try:
         parsed = urlparse(dsn)
@@ -128,7 +170,7 @@ def _sql(query: str) -> str:
 
 @contextmanager
 def _connect(path: Path | None = None) -> Iterator[Any]:
-    global _PG_POOL, _PG_SCHEMA_READY, _POSTGRES_MIGRATED, _BACKEND_LOGGED
+    global _PG_POOL, _PG_SCHEMA_READY, _POSTGRES_MIGRATED, _POSTGRES_BOOL_MIGRATED, _BACKEND_LOGGED
 
     if _USE_POSTGRES:
         if SimpleConnectionPool is None or psycopg2 is None or pg_extras is None:  # pragma: no cover
@@ -144,6 +186,9 @@ def _connect(path: Path | None = None) -> Iterator[Any]:
             if not _PG_SCHEMA_READY:
                 _ensure_schema_postgres(conn)
                 _PG_SCHEMA_READY = True
+            if not _POSTGRES_BOOL_MIGRATED:
+                _migrate_postgres_boolean_columns(conn)
+                _POSTGRES_BOOL_MIGRATED = True
             if not _POSTGRES_MIGRATED:
                 _migrate_legacy_sources(conn)
                 _POSTGRES_MIGRATED = True
@@ -337,6 +382,55 @@ def _ensure_schema_postgres(conn: Any) -> None:
             cur.execute(stmt)
 
 
+def _postgres_column_type(conn: Any, column: str) -> str | None:
+    query = """
+        SELECT data_type
+        FROM information_schema.columns
+        WHERE table_schema = current_schema()
+          AND table_name = 'subscribers'
+          AND column_name = %s
+    """
+    with conn.cursor() as cur:
+        cur.execute(query, (column,))
+        row = cur.fetchone()
+    if not row:
+        return None
+    value = row[0]
+    if isinstance(value, str):
+        return value.lower()
+    return None
+
+
+def _migrate_postgres_boolean_columns(conn: Any) -> None:
+    columns = ("is_subscribed", "awaiting_contact")
+    needs_migration = []
+    for column in columns:
+        column_type = _postgres_column_type(conn, column)
+        if column_type and column_type not in {"boolean", "bool"}:
+            needs_migration.append(column)
+    if not needs_migration:
+        return
+
+    statements = [
+        f"""
+        ALTER TABLE subscribers
+        ALTER COLUMN {column} TYPE BOOLEAN
+        USING (
+            CASE
+                WHEN {column} IN (1, '1', TRUE, 't') THEN TRUE
+                ELSE FALSE
+            END
+        )
+        """
+        for column in needs_migration
+    ]
+
+    with conn.cursor() as cur:
+        for stmt in statements:
+            cur.execute(stmt)
+    LOGGER.info("Migrated boolean columns in subscribers table")
+
+
 def _execute(conn: Any, query: str, params: Tuple[Any, ...] = (), *, fetchone: bool = False, fetchall: bool = False):
     statement = _sql(query)
     if _USE_POSTGRES:
@@ -406,8 +500,8 @@ def _upsert_subscriber_with_conn(
     first_name: str,
     last_name: str,
     username: str,
-    is_subscribed: bool,
-    awaiting_contact: bool | object,
+    is_subscribed: Any,
+    awaiting_contact: Any,
     contact_prompted_at: datetime | str | None | object,
 ) -> Tuple[bool, Subscriber]:
     row = _execute(
@@ -417,16 +511,30 @@ def _upsert_subscriber_with_conn(
         fetchone=True,
     )
 
+    backend = "postgresql" if _USE_POSTGRES else "sqlite"
     now = _now_iso()
-    awaiting_value = bool(awaiting_contact) if awaiting_contact is not _UNSET else False
+    is_subscribed_bool = _coerce_boolish(is_subscribed, default=True)
+    awaiting_coerced: bool | None
+    if awaiting_contact is _UNSET:
+        awaiting_coerced = None
+    else:
+        awaiting_coerced = _coerce_boolish(awaiting_contact, allow_none=True)
     prompted_value = _normalise_timestamp(contact_prompted_at) if contact_prompted_at is not _UNSET else None
-    masked_phone = phone_normalised if len(phone_normalised) <= 6 else f"{phone_normalised[:4]}…{phone_normalised[-2:]}"
+    phone_for_log = phone_normalised or (row["phone_e164"] if row else "") or ""
+    awaiting_for_log = (
+        awaiting_coerced
+        if awaiting_coerced is not None
+        else (bool(row["awaiting_contact"]) if row else False)
+    )
+    masked_phone = _mask_phone(phone_for_log)
     LOGGER.info(
-        "Upserting subscriber chat_id=%s phone=%s subscribed=%s awaiting=%s",
+        "Upserting subscriber backend=%s table=%s chat_id=%s phone=%s subscribed=%s awaiting=%s",
+        backend,
+        "subscribers",
         chat_id_str,
         masked_phone,
-        bool(is_subscribed),
-        awaiting_value,
+        is_subscribed_bool,
+        awaiting_for_log,
     )
 
     if row is None:
@@ -436,12 +544,13 @@ def _upsert_subscriber_with_conn(
             "first_name": first_name,
             "last_name": last_name,
             "username": username,
-            "is_subscribed": bool(is_subscribed),
-            "awaiting_contact": awaiting_value,
+            "is_subscribed": bool(is_subscribed_bool),
+            "awaiting_contact": awaiting_for_log,
             "contact_prompted_at": prompted_value,
             "subscribed_at": now,
             "updated_at": now,
         }
+        awaiting_insert = awaiting_for_log if isinstance(awaiting_for_log, bool) else False
         _execute(
             conn,
             """
@@ -455,14 +564,18 @@ def _upsert_subscriber_with_conn(
                 first_name or None,
                 last_name or None,
                 username or None,
-                1 if is_subscribed else 0,
-                1 if awaiting_value else 0,
+                bool(is_subscribed_bool),
+                bool(awaiting_insert),
                 prompted_value,
                 now,
                 now,
             ),
         )
-        LOGGER.info("Inserted new subscriber chat_id=%s", chat_id_str)
+        LOGGER.info(
+            "Subscriber upsert succeeded backend=%s action=insert chat_id=%s",
+            backend,
+            chat_id_str,
+        )
         return True, subscriber
 
     existing = {
@@ -492,13 +605,13 @@ def _upsert_subscriber_with_conn(
     if existing["username"] != username:
         new_values["username"] = username
         changed = True
-    if existing["is_subscribed"] != bool(is_subscribed):
-        new_values["is_subscribed"] = bool(is_subscribed)
+    if existing["is_subscribed"] != bool(is_subscribed_bool):
+        new_values["is_subscribed"] = bool(is_subscribed_bool)
         changed = True
     if awaiting_contact is not _UNSET:
-        awaiting_bool = bool(awaiting_contact)
-        if existing["awaiting_contact"] != awaiting_bool:
-            new_values["awaiting_contact"] = awaiting_bool
+        awaiting_bool = awaiting_coerced if awaiting_coerced is not None else False
+        if existing["awaiting_contact"] != bool(awaiting_bool):
+            new_values["awaiting_contact"] = bool(awaiting_bool)
             changed = True
     if contact_prompted_at is not _UNSET:
         normalised_prompt = _normalise_timestamp(contact_prompted_at)
@@ -519,15 +632,24 @@ def _upsert_subscriber_with_conn(
                 new_values["first_name"] or None,
                 new_values["last_name"] or None,
                 new_values["username"] or None,
-                1 if new_values["is_subscribed"] else 0,
-                1 if new_values["awaiting_contact"] else 0,
+                bool(new_values["is_subscribed"]),
+                bool(new_values["awaiting_contact"]),
                 new_values["contact_prompted_at"],
                 new_values["updated_at"],
                 chat_id_str,
             ),
         )
-        LOGGER.info("Updated subscriber chat_id=%s", chat_id_str)
+        LOGGER.info(
+            "Subscriber upsert succeeded backend=%s action=update chat_id=%s",
+            backend,
+            chat_id_str,
+        )
         return True, new_values
+    LOGGER.info(
+        "Subscriber upsert no-op backend=%s chat_id=%s",
+        backend,
+        chat_id_str,
+    )
     return False, existing
 
 
@@ -570,7 +692,8 @@ def get_active_chat_ids(path: Path | None = None) -> List[str]:
     with _connect(path) as conn:
         rows = _execute(
             conn,
-            "SELECT tg_user_id FROM subscribers WHERE is_subscribed = 1 ORDER BY subscribed_at",
+            "SELECT tg_user_id FROM subscribers WHERE is_subscribed = ? ORDER BY subscribed_at",
+            (True,),
             fetchall=True,
         )
     return [row["tg_user_id"] for row in rows]
@@ -578,11 +701,13 @@ def get_active_chat_ids(path: Path | None = None) -> List[str]:
 
 def count_subscribers(*, path: Path | None = None, only_active: bool = False) -> int:
     query = "SELECT COUNT(1) AS total FROM subscribers"
+    params: Tuple[Any, ...] = ()
     if only_active:
-        query += " WHERE is_subscribed = 1"
+        query += " WHERE is_subscribed = ?"
+        params = (True,)
 
     with _connect(path) as conn:
-        row = _execute(conn, query, fetchone=True)
+        row = _execute(conn, query, params, fetchone=True)
     if not row:
         return 0
     if isinstance(row, dict):
