@@ -5,6 +5,7 @@
 import asyncio
 import logging
 import threading
+import weakref
 from typing import Optional
 
 import listen_start
@@ -15,6 +16,7 @@ LOGGER = logging.getLogger("signal_bot.listen_updates")
 REGISTER_LOGGER = logging.getLogger("register")
 
 KNOWN_COMMANDS = frozenset({"/start", "/menu", "/get", "/add", "/remove", "/debug"})
+_REGISTERED_APPS = weakref.WeakSet()
 
 
 async def on_unknown(update, context) -> None:
@@ -453,7 +455,7 @@ def _register_handlers(
     command_filter=None,
     update_cls=None,
 ):
-    if getattr(app, "_handlers_registered", False):
+    if getattr(app, "_handlers_registered", False) or app in _REGISTERED_APPS:
         LOGGER.debug("Skipping handler registration on %r; already configured", app)
         return
 
@@ -482,7 +484,16 @@ def _register_handlers(
     app.add_handler(message_handler_cls(command_filter, on_unknown), group=2)
     REGISTER_LOGGER.info("unknown handler registered LAST")
 
-    setattr(app, "_handlers_registered", True)
+    try:
+        setattr(app, "_handlers_registered", True)
+    except AttributeError:
+        try:
+            _REGISTERED_APPS.add(app)
+        except TypeError:
+            LOGGER.debug(
+                "Unable to track handler registration for %r; unsupported weakref",
+                app,
+            )
 
 
 def run_polling_main() -> None:
