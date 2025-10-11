@@ -11,10 +11,17 @@ from zoneinfo import ZoneInfo
 from typing import TYPE_CHECKING
 from dotenv import load_dotenv
 try:
-    from telegram import Bot as TelegramBot
+    from telegram import Bot as TelegramBot, KeyboardButton, ReplyKeyboardMarkup
     from telegram.error import RetryAfter, TimedOut
+    from telegram.ext import CommandHandler
 except ModuleNotFoundError:  # pragma: no cover - fallback when dependency missing
     TelegramBot = None
+    KeyboardButton = None
+    ReplyKeyboardMarkup = None
+
+    class CommandHandler:  # type: ignore[empty-body]
+        def __init__(self, *args, **kwargs) -> None:
+            raise RuntimeError("python-telegram-bot is required for CommandHandler")
 
     class RetryAfter(Exception):
         def __init__(self, retry_after: float = 1.0):
@@ -1660,6 +1667,23 @@ def process_updates(duration_seconds: float | None = None, poll_timeout: float =
     finally:
         flush_changes()
 
+
+
+async def on_start(update, context):
+    keyboard = [[KeyboardButton("📱 ارسال شماره من", request_contact=True)]]
+    reply_markup = ReplyKeyboardMarkup(
+        keyboard,
+        resize_keyboard=True,
+        one_time_keyboard=True,
+    )
+    await update.message.reply_text(
+        "سلام 👋\nبرای فعال‌سازی ربات لطفاً شماره‌ت رو ارسال کن:",
+        reply_markup=reply_markup,
+    )
+
+
+def register_start_handler(app):
+    app.add_handler(CommandHandler("start", on_start))
 
 
 def main():  # pragma: no cover - retained for manual execution
