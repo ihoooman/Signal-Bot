@@ -70,7 +70,7 @@ class EmergencyBroadcastTests(unittest.TestCase):
     def test_summary_groups_signals(self):
         trigger_xrp_bot.DEFAULT_PAIRS = ("XRPUSDT", "BTCUSDT")
 
-        def fake_eval(symbol, name):
+        def fake_eval(symbol, name, pair=None):
             if symbol == "XRP":
                 return name, "BUY", "Daily", self.ctx, 0.6, 0.02, "next 3D"
             if symbol == "BTC":
@@ -91,7 +91,7 @@ class EmergencyBroadcastTests(unittest.TestCase):
     def test_generate_on_demand_update_includes_emergency(self):
         add_to_watchlist(111, "BTCUSDT", path=self.subs_path)
 
-        def fake_eval(symbol, name):
+        def fake_eval(symbol, name, pair=None):
             if symbol == "XRP":
                 return name, "BUY", "Daily", self.ctx, 0.6, 0.02, "next 3D"
             if symbol == "BTC":
