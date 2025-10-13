@@ -254,9 +254,14 @@ def _match_exchange_pair(raw_text: str) -> str | None:
     pair = lookup.get(token)
     if pair:
         return pair
-    if token.endswith("USDT"):
-        return None
-    return lookup.get(f"{token}USDT")
+    if not token.endswith("USDT"):
+        pair = lookup.get(f"{token}USDT")
+        if pair:
+            return pair
+    result = resolve_instrument(raw_text)
+    if result.status == "resolved" and result.pair:
+        return result.pair
+    return None
 
 
 DONATION_TIERS = _parse_donation_tiers(os.getenv("DONATION_TIERS", "100,500,1000"))
