@@ -120,6 +120,9 @@ OFFSET_FILE = Path(os.getenv("OFFSET_FILE", str(ROOT / "data" / "offset.txt"))).
 LEGACY_OFFSET_FILE = Path(os.getenv("LEGACY_OFFSET_FILE", str(ROOT / "offset.json"))).expanduser()
 STATE_FILE = Path(os.getenv("CONVERSATION_STATE_PATH", str(ROOT / "conversation_state.json"))).expanduser()
 SNAPSHOT_PATH = Path(os.getenv("SNAPSHOT_PATH", str(ROOT / "data" / "last_summary.json"))).expanduser()
+EXCHANGE_PAIRS_PATH = Path(
+    os.getenv("EXCHANGE_PAIRS_PATH", str(ROOT / "data" / "exchange_pairs.json"))
+).expanduser()
 SNAPSHOT_MAX_AGE = timedelta(hours=2)
 
 SCHEMA_LOGGER = logging.getLogger("signal_bot.schema")
@@ -179,6 +182,81 @@ def _parse_admin_ids(raw: str | None) -> set[int]:
         except (TypeError, ValueError):
             continue
     return ids
+
+
+def _normalise_pair_token(text: str | None) -> str:
+    return re.sub(r"[^0-9A-Za-z]+", "", (text or "")).upper()
+
+
+@lru_cache(maxsize=1)
+def _exchange_pairs_data() -> list[dict[str, object]]:
+    try:
+        payload = json.loads(EXCHANGE_PAIRS_PATH.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return []
+    except Exception as exc:  # pragma: no cover - malformed data
+        LOGGER.warning("Failed to load exchange pairs from %s: %s", EXCHANGE_PAIRS_PATH, exc)
+        return []
+
+    if isinstance(payload, dict):
+        payload = payload.get("pairs", [])
+
+    if not isinstance(payload, list):
+        return []
+
+    cleaned: list[dict[str, object]] = []
+    for entry in payload:
+        if not isinstance(entry, dict):
+            continue
+        pair = _normalise_pair_token(str(entry.get("pair") or ""))
+        if not pair or not pair.endswith("USDT"):
+            continue
+        symbol = _normalise_pair_token(str(entry.get("symbol") or ""))
+        name = str(entry.get("name") or "")
+        aliases_raw = entry.get("aliases") or []
+        if isinstance(aliases_raw, str):
+            aliases_raw = [aliases_raw]
+        aliases = [str(alias) for alias in aliases_raw if isinstance(alias, str)]
+        cleaned.append({"pair": pair, "symbol": symbol, "name": name, "aliases": aliases})
+    return cleaned
+
+
+@lru_cache(maxsize=1)
+def _exchange_pair_lookup() -> dict[str, str]:
+    mapping: dict[str, str] = {}
+    for entry in _exchange_pairs_data():
+        pair = str(entry.get("pair"))
+        symbol = str(entry.get("symbol") or "")
+        name = str(entry.get("name") or "")
+        aliases = list(entry.get("aliases") or [])
+
+        tokens = {pair, symbol}
+        if name:
+            tokens.add(name)
+            tokens.update(name.split())
+        tokens.update(aliases)
+        for alias in list(tokens):
+            normalised = _normalise_pair_token(alias)
+            if not normalised:
+                continue
+            mapping.setdefault(normalised, pair)
+            if not normalised.endswith("USDT"):
+                composed = f"{normalised}USDT"
+                mapping.setdefault(composed, pair)
+    return mapping
+
+
+def _match_exchange_pair(raw_text: str) -> str | None:
+    token = _normalise_pair_token(raw_text)
+    if not token:
+        return None
+    lookup = _exchange_pair_lookup()
+    pair = lookup.get(token)
+    if pair:
+        return pair
+    if token.endswith("USDT"):
+        return None
+    return lookup.get(f"{token}USDT")
 
 
 DONATION_TIERS = _parse_donation_tiers(os.getenv("DONATION_TIERS", "100,500,1000"))
@@ -983,9 +1061,9 @@ def handle_add_asset_start(state: dict, chat_id: int | str) -> bool:
 
 def _confirm_watchlist_add(chat_id: int | str, pair: str, added: bool) -> None:
     if added:
-        message = f"{pair} به واچ‌لیست شما اضافه شد و در به‌روزرسانی‌ها لحاظ می‌شود."
+        message = f"ارز {pair} با موفقیت اضافه شد ✅"
     else:
-        message = f"{pair} پیش‌تر در واچ‌لیست شما ثبت شده بود."
+        message = f"ارز {pair} پیش‌تر به واچ‌لیست شما اضافه شده بود ⚠️"
     try:
         send_telegram(str(chat_id), message)
     except Exception as exc:  # pragma: no cover - network failure
@@ -1037,6 +1115,17 @@ def _send_ambiguous_options(chat_id: int | str, candidates: list[ResolutionCandi
 
 
 def handle_add_asset_text(state: dict, chat_id: int | str, raw_text: str) -> bool:
+    pair = _match_exchange_pair(raw_text)
+    if pair:
+        added = add_to_watchlist(chat_id, pair, path=SUBS_FILE)
+        _confirm_watchlist_add(chat_id, pair, added)
+        clear_conversation(state, chat_id)
+        try:
+            send_menu(chat_id)
+        except Exception as exc:  # pragma: no cover
+            print(f"Failed to send menu after add for {chat_id}: {exc}")
+        return True
+
     result: ResolutionResult = resolve_instrument(raw_text)
     if result.status == "error":
         if result.reason == "EMPTY_INPUT":

@@ -1,0 +1,12 @@
+[
+  {"pair": "BTCUSDT", "symbol": "BTC", "name": "Bitcoin", "aliases": ["BTC", "Bitcoin"]},
+  {"pair": "ETHUSDT", "symbol": "ETH", "name": "Ethereum", "aliases": ["ETH", "Ether", "Ethereum"]},
+  {"pair": "BNBUSDT", "symbol": "BNB", "name": "Binance Coin", "aliases": ["BNB", "Binance", "Binance Coin"]},
+  {"pair": "SOLUSDT", "symbol": "SOL", "name": "Solana", "aliases": ["SOL", "Solana"]},
+  {"pair": "XRPUSDT", "symbol": "XRP", "name": "XRP", "aliases": ["XRP", "Ripple"]},
+  {"pair": "ADAUSDT", "symbol": "ADA", "name": "Cardano", "aliases": ["ADA", "Cardano"]},
+  {"pair": "DOGEUSDT", "symbol": "DOGE", "name": "Dogecoin", "aliases": ["DOGE", "Dogecoin", "Doge"]},
+  {"pair": "TRXUSDT", "symbol": "TRX", "name": "TRON", "aliases": ["TRX", "TRON"]},
+  {"pair": "MATICUSDT", "symbol": "MATIC", "name": "Polygon", "aliases": ["MATIC", "Polygon"]},
+  {"pair": "LINKUSDT", "symbol": "LINK", "name": "Chainlink", "aliases": ["LINK", "Chainlink"]}
+]

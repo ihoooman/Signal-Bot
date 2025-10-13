@@ -98,20 +98,21 @@ def resolve_chat_ids(subscribers: list[dict[str, str]], fallback_chat_id: str | 
 
 
 # ===== Thresholds (قابل تغییر) =====
-BUY_RSI_D_MIN   = 55   # Daily RSI برای خرید
-SELL_RSI_D_MAX  = 45   # Daily RSI برای فروش
+BUY_RSI_D_MIN   = 52   # Daily RSI برای خرید (کمی آسان‌تر برای سیگنال)
+SELL_RSI_D_MAX  = 48   # Daily RSI برای فروش (آستانه بالاتر برای حساسیت بیشتر)
 
-H4_RSI_BUY_MIN  = 35   # 4h RSI برای خرید
-H4_RSI_BUY_MAX  = 45
+H4_RSI_BUY_MIN  = 32   # 4h RSI برای خرید
+H4_RSI_BUY_MAX  = 50
 
-H4_RSI_SELL_MIN = 55   # 4h RSI برای فروش
-H4_RSI_SELL_MAX = 65
+H4_RSI_SELL_MIN = 50   # 4h RSI برای فروش
+H4_RSI_SELL_MAX = 68
 
 # بک‌تست: افق زمانی و آستانه سود/ضرر
 DAILY_LOOKAHEAD_BARS = 3     # 3 کندل روزانه بعدی
 H4_LOOKAHEAD_BARS    = 6     # 6 کندل 4ساعته (~24 ساعت)
 PROFIT_THRESHOLD     = 0.01  # 1% به عنوان برد برای Buy (و -1% برای Sell)
 NEAR_PCT             = 0.01  # 1% نزدیکی ساپورت/مقاومت
+SMA_TOLERANCE_PCT    = 0.01  # 1% تلورانس برای قرارگیری قیمت نسبت به SMA50
 
 # دارایی‌ها: XRP + BTC + ETH + SOL
 DEFAULT_PAIRS = tuple(pair.upper() for pair in get_default_pairs())
@@ -441,7 +442,7 @@ def format_emergency_report(results: list[dict[str, object]]) -> str | None:
 
 # ===================== منطق هر نماد =====================
 
-def evaluate_symbol(symbol: str, name: str):
+def evaluate_symbol(symbol: str, name: str, pair: str | None = None):
     # Daily (CryptoCompare)
     d1 = fetch_cc(symbol, "USD", "1d", limit=220)
     close_d = d1["close"]
@@ -450,8 +451,14 @@ def evaluate_symbol(symbol: str, name: str):
     sma50_d = close_d.rolling(50).mean()
 
     # سیگنال‌های روزانه جاری
-    primary = last_cross_up(macd_d, sig_d) and (rsi_d.iloc[-1] > BUY_RSI_D_MIN) and (close_d.iloc[-1] > sma50_d.iloc[-1])
-    sell_primary = last_cross_down(macd_d, sig_d) and (rsi_d.iloc[-1] < SELL_RSI_D_MAX) and (close_d.iloc[-1] < sma50_d.iloc[-1])
+    rsi_d_last = float(rsi_d.iloc[-1])
+    price_d_last = float(close_d.iloc[-1])
+    sma50_last = float(sma50_d.iloc[-1])
+    price_above_sma = price_d_last >= sma50_last * (1 - SMA_TOLERANCE_PCT)
+    price_below_sma = price_d_last <= sma50_last * (1 + SMA_TOLERANCE_PCT)
+
+    primary = last_cross_up(macd_d, sig_d) and (rsi_d_last >= BUY_RSI_D_MIN) and price_above_sma
+    sell_primary = last_cross_down(macd_d, sig_d) and (rsi_d_last <= SELL_RSI_D_MAX) and price_below_sma
 
     # 4h (CryptoCompare)
     h4 = fetch_cc(symbol, "USD", "4h", limit=320)
@@ -472,8 +479,9 @@ def evaluate_symbol(symbol: str, name: str):
 
     near_res = near(price_now, recent_high, pct=NEAR_PCT)
 
-    rsi_buy_band  = H4_RSI_BUY_MIN  <= float(rsi_h4.iloc[-1]) <= H4_RSI_BUY_MAX
-    rsi_sell_band = H4_RSI_SELL_MIN <= float(rsi_h4.iloc[-1]) <= H4_RSI_SELL_MAX
+    rsi_h4_last = float(rsi_h4.iloc[-1])
+    rsi_buy_band  = H4_RSI_BUY_MIN  <= rsi_h4_last <= H4_RSI_BUY_MAX
+    rsi_sell_band = H4_RSI_SELL_MIN <= rsi_h4_last <= H4_RSI_SELL_MAX
 
     div_ok  = bullish_divergence(close_h4, rsi_h4)
     div_neg = bearish_divergence(close_h4, rsi_h4)
@@ -519,16 +527,20 @@ def evaluate_symbol(symbol: str, name: str):
 
     ctx = dict(
         price=price_now,
-        rsi_d=float(rsi_d.iloc[-1]),
-        rsi_h4=float(rsi_h4.iloc[-1]),
+        rsi_d=rsi_d_last,
+        rsi_h4=rsi_h4_last,
         hist_d=float((macd_d - sig_d).iloc[-1]),  # برای نمایش مختصر
         hist_h4=float((macd_h4 - sig_h4).iloc[-1]),
-        sma50_d=float(sma50_d.iloc[-1]),
+        sma50_d=sma50_last,
         support_ok=support_ok,
         div_ok=div_ok,
         near_res=near_res,
         div_neg=div_neg,
     )
+
+    if signal_type == "NONE":
+        label = pair or f"{symbol}USDT"
+        LOGGER.debug("no condition met for %s", label)
 
     return name, signal_type, timeframe, ctx, prob, avg_ret, horizon_label
 
@@ -608,7 +620,11 @@ def _evaluate_pair(pair: str) -> dict[str, object]:
     if not inst:
         raise ValueError(f"Unsupported instrument pair: {pair}")
     try:
-        name, sig, tf, ctx, prob, avg_ret, hz = evaluate_symbol(inst.symbol, inst.display_name)
+        name, sig, tf, ctx, prob, avg_ret, hz = evaluate_symbol(
+            inst.symbol,
+            inst.display_name,
+            inst.pair,
+        )
         block = build_message_block(inst.display_name, inst.pair, sig, tf, ctx, prob, avg_ret, hz)
         signal_value = sig if sig in ("BUY", "SELL") else "NO ACTION"
         return {

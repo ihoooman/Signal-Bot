@@ -50,6 +50,10 @@ class AddAssetFlowTests(unittest.TestCase):
         self.addCleanup(setattr, listen_start, "DONATION_TIERS", self.prev_tiers)
         listen_start._tehran_zone.cache_clear()
         self.addCleanup(listen_start._tehran_zone.cache_clear)
+        listen_start._exchange_pairs_data.cache_clear()
+        self.addCleanup(listen_start._exchange_pairs_data.cache_clear)
+        listen_start._exchange_pair_lookup.cache_clear()
+        self.addCleanup(listen_start._exchange_pair_lookup.cache_clear)
         self.prev_admins = listen_start.ADMIN_CHAT_IDS
         listen_start.ADMIN_CHAT_IDS = set()
         self.addCleanup(setattr, listen_start, "ADMIN_CHAT_IDS", self.prev_admins)
@@ -130,7 +134,33 @@ class AddAssetFlowTests(unittest.TestCase):
         watchlist = listen_start.get_user_watchlist("1", path=self.subs_path)
         self.assertEqual(watchlist, ["SOLUSDT"])
         mock_menu.assert_called_once()
-        mock_send.assert_called()  # confirmation sent
+        mock_send.assert_any_call("1", "ارز SOLUSDT با موفقیت اضافه شد ✅")
+
+    def test_handle_add_asset_text_uses_exchange_lookup_for_aliases(self):
+        state = {"conversations": {"1": {"state": "await_symbol"}}}
+        with mock.patch.object(listen_start, "send_telegram") as mock_send, \
+            mock.patch.object(listen_start, "send_menu") as mock_menu:
+            changed = listen_start.handle_add_asset_text(state, "1", "binance")
+
+        self.assertTrue(changed)
+        self.assertIsNone(listen_start.get_conversation(state, "1"))
+        watchlist = listen_start.get_user_watchlist("1", path=self.subs_path)
+        self.assertIn("BNBUSDT", watchlist)
+        mock_menu.assert_called_once()
+        mock_send.assert_any_call("1", "ارز BNBUSDT با موفقیت اضافه شد ✅")
+
+    def test_handle_add_asset_text_does_not_duplicate_pairs(self):
+        subscriptions.add_to_watchlist("1", "SOLUSDT", path=self.subs_path)
+        state = {"conversations": {"1": {"state": "await_symbol"}}}
+        with mock.patch.object(listen_start, "send_telegram") as mock_send, \
+            mock.patch.object(listen_start, "send_menu") as mock_menu:
+            changed = listen_start.handle_add_asset_text(state, "1", "sol")
+
+        self.assertTrue(changed)
+        watchlist = listen_start.get_user_watchlist("1", path=self.subs_path)
+        self.assertEqual(watchlist, ["SOLUSDT"])
+        mock_menu.assert_called_once()
+        mock_send.assert_any_call("1", "ارز SOLUSDT پیش‌تر به واچ‌لیست شما اضافه شده بود ⚠️")
 
     def test_handle_add_asset_pick_uses_candidates(self):
         state = {"conversations": {"1": {"state": "await_pick", "candidates": ["BTCUSDT"]}}}
