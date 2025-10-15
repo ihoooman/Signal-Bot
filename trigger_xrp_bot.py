@@ -144,12 +144,32 @@ def parse_args():
 
 # ===================== ابزار داده و اندیکاتورها =====================
 
+TIMEFRAME_CONFIG = (
+    ("1d", "1D", 0.5),
+    ("4h", "4H", 0.3),
+    ("15m", "15M", 0.2),
+)
+
+INDICATOR_WEIGHTS = {
+    "rsi": 0.35,
+    "macd": 0.30,
+    "trend": 0.20,
+    "volume": 0.15,
+}
+
+COOLDOWN_BARS = 4
+_COOLDOWN_SECONDS = COOLDOWN_BARS * 15 * 60
+_SIGNAL_HISTORY: dict[str, dict[str, float]] = {}
+
+
 def fetch_cc(fsym: str, tsym: str, timeframe: str, limit=300):
-    """Fetch OHLCV from CryptoCompare. timeframe: '1d' or '4h' (aggregated)."""
+    """Fetch OHLCV from CryptoCompare. timeframe: '1d', '4h', or '15m'."""
     if timeframe == "1d":
         url = f"{CRYPTOCOMPARE_BASE}/histoday?fsym={fsym}&tsym={tsym}&limit={limit}"
     elif timeframe == "4h":
         url = f"{CRYPTOCOMPARE_BASE}/histohour?fsym={fsym}&tsym={tsym}&aggregate=4&limit={limit}"
+    elif timeframe == "15m":
+        url = f"{CRYPTOCOMPARE_BASE}/histominute?fsym={fsym}&tsym={tsym}&aggregate=15&limit={limit}"
     else:
         raise ValueError("Unsupported timeframe")
     headers = {"Authorization": f"Apikey {CRYPTOCOMPARE_API_KEY}"} if CRYPTOCOMPARE_API_KEY else {}
@@ -185,6 +205,23 @@ def macd(series, fast=12, slow=26, signal=9):
     signal_line = ema(macd_line, signal)
     hist = macd_line - signal_line
     return macd_line, signal_line, hist
+
+
+def atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    high = df["high"]
+    low = df["low"]
+    close = df["close"]
+    prev_close = close.shift(1)
+    true_range = pd.concat(
+        [
+            (high - low).abs(),
+            (high - prev_close).abs(),
+            (low - prev_close).abs(),
+        ],
+        axis=1,
+    ).max(axis=1)
+    return true_range.rolling(period).mean()
+
 
 def last_cross_up(line, signal):
     if len(line) < 2: return False
@@ -356,58 +393,94 @@ def broadcast(text: str, chat_ids: list[str], *, job: str, events: list[dict[str
 
 def build_message_block(symbol_name, symbol_pair, signal_type, timeframe, ctx, prob=None, avg_ret=None, horizon_label=""):
     dt = tehran_now()
-    if signal_type == "BUY":
-        head = f"<b>{symbol_pair}</b> ({symbol_name}) — <b>BUY SIGNAL ✅</b>  |  <b>{timeframe}</b>  |  {dt}"
-    elif signal_type == "SELL":
-        head = f"<b>{symbol_pair}</b> ({symbol_name}) — <b>SELL SIGNAL ⛔️</b>  |  <b>{timeframe}</b>  |  {dt}"
+    emoji = "🟢" if signal_type == "BUY" else "🔴" if signal_type == "SELL" else "⚪"
+    if signal_type in ("BUY", "SELL"):
+        head = (
+            f"{emoji} <b>{symbol_pair}</b> ({symbol_name}) — <b>{signal_type}</b> "
+            f"| <b>{timeframe or ctx.get('dominant_timeframe', 'Multi')}</b> | {dt}"
+        )
     else:
-        head = f"<b>{symbol_pair}</b> ({symbol_name}) — <b>No signal ❌</b>  |  {dt}"
+        head = f"{emoji} <b>{symbol_pair}</b> ({symbol_name}) — <b>No actionable signal</b> | {dt}"
 
-    lines = [
-        head,
-        f"Price: <b>{ctx['price']:.4f}$</b>",
-        f"Daily — RSI14: {ctx['rsi_d']:.2f} | MACD-Hist: {ctx['hist_d']:.4f} | SMA50: {ctx['sma50_d']:.4f}",
-        f"4h — RSI14: {ctx['rsi_h4']:.2f} | MACD-Hist: {ctx['hist_h4']:.4f}",
-    ]
+    lines = [head, f"Price: <b>{ctx['price']:.4f}$</b>"]
+    lines.append(
+        f"Market state: {ctx.get('volatility', 'unknown')} | ATR%: {ctx.get('atr_pct', 0.0):.2f}"
+    )
+
+    breakdown = ctx.get("timeframes", {})
+    for tf_label in ("1D", "4H", "15M"):
+        detail = breakdown.get(tf_label)
+        if not detail:
+            continue
+        lines.append(
+            f"{tf_label} — RSI: {detail['rsi']:.2f} (≤{detail['rsi_trigger_buy']:.0f}/≥{detail['rsi_trigger_sell']:.0f}) | "
+            f"MACD-Hist: {detail['macd_hist']:.4f} | EMA: {detail['ema']:.4f} | Vol×: {detail['volume_ratio']:.2f}"
+        )
+
+    confidence = ctx.get("confidence", {})
+    lines.append(
+        "Confidence — BUY: {buy:.1f}% | SELL: {sell:.1f}%".format(
+            buy=confidence.get("buy", 0.0), sell=confidence.get("sell", 0.0)
+        )
+    )
+
     if prob is not None and avg_ret is not None and horizon_label:
-        lines.append(f"Backtest({horizon_label}) — Prob. profit: <b>{prob*100:.1f}%</b> | Avg fwd return: <b>{avg_ret*100:.2f}%</b>")
+        lines.append(
+            f"Backtest({horizon_label}) — Prob. profit: <b>{prob*100:.1f}%</b> | Avg fwd return: <b>{avg_ret*100:.2f}%</b>"
+        )
 
-    extra = []
-    if ctx.get('support_ok'):
-        extra.append("near support")
-    if ctx.get('near_res'):
-        extra.append("near resistance")
-    if extra:
-        lines.append("Context: " + ", ".join(extra))
+    if ctx.get("cooldown_active"):
+        lines.append("Cooldown active — awaiting 4×15m bars before reissuing signal")
 
     return "\n".join(lines)
+
+
+def build_summary_line(pair: str, signal: str, confidence: int, bias: tuple[str, int] | None, strength: str) -> str:
+    strength_text = ""
+    if signal in ("BUY", "SELL") and strength not in ("none", ""):
+        strength_text = f", {strength}"
+
+    if signal == "BUY":
+        return (
+            f"🟢 <b>{pair}</b> → <span style='color:#2ecc71;'><b>BUY</b></span> "
+            f"(Confidence: {confidence}%{strength_text})"
+        )
+    if signal == "SELL":
+        return (
+            f"🔴 <b>{pair}</b> → <span style='color:#e74c3c;'><b>SELL</b></span> "
+            f"(Confidence: {confidence}%{strength_text})"
+        )
+    if bias:
+        return f"⚪ <b>{pair}</b> → NO ACTION ({bias[0]} bias {bias[1]}%)"
+    return f"⚪ <b>{pair}</b> → NO ACTION"
 
 
 def format_summary_report(results: list[dict[str, object]]) -> str:
     dt = tehran_now()
     sections: list[str] = [f"<b>📊 SUMMARY REPORT (4h)</b> — {dt}", ""]
 
-    groups = {"BUY": [], "SELL": [], "NO ACTION": []}
     errors: list[str] = []
-    for res in results:
-        signal = res.get("signal")
-        text = res.get("text", "")
-        if signal in ("BUY", "SELL"):
-            groups[signal].append(text)
-        elif signal == "ERROR":
-            errors.append(text)
-        else:
-            groups["NO ACTION"].append(text)
+    grouped: dict[str, list[str]] = {"BUY": [], "SELL": [], "NO ACTION": []}
 
-    titles = [
-        ("BUY", "✅ <b>BUY</b>"),
-        ("SELL", "⛔️ <b>SELL</b>"),
-        ("NO ACTION", "⚪️ <b>NO ACTION</b>"),
-    ]
-    for key, title in titles:
-        sections.append(title)
-        if groups[key]:
-            sections.append("\n\n".join(str(entry) for entry in groups[key]))
+    for res in results:
+        signal = str(res.get("signal") or "NO ACTION")
+        if signal == "ERROR":
+            errors.append(str(res.get("text", "")))
+            continue
+        summary_line = str(res.get("summary_line") or res.get("text") or "")
+        grouped.setdefault(signal, []).append(summary_line)
+
+    titles = {
+        "BUY": "🟢 <b>BUY</b>",
+        "SELL": "🔴 <b>SELL</b>",
+        "NO ACTION": "⚪ <b>NO ACTION</b>",
+    }
+
+    for key in ("BUY", "SELL", "NO ACTION"):
+        sections.append(titles[key])
+        entries = grouped.get(key) or []
+        if entries:
+            sections.extend(entries)
         else:
             sections.append("هیچ موردی ثبت نشد.")
         sections.append("")
@@ -443,82 +516,234 @@ def format_emergency_report(results: list[dict[str, object]]) -> str | None:
 # ===================== منطق هر نماد =====================
 
 def evaluate_symbol(symbol: str, name: str, pair: str | None = None):
-    # Daily (CryptoCompare)
-    d1 = fetch_cc(symbol, "USD", "1d", limit=220)
+    datasets: dict[str, pd.DataFrame] = {}
+    derived: dict[str, dict[str, pd.Series]] = {}
+    confidence_contrib_buy: dict[str, float] = {}
+    confidence_contrib_sell: dict[str, float] = {}
+    timeframe_details: dict[str, dict[str, float]] = {}
+
+    for timeframe, label, weight in TIMEFRAME_CONFIG:
+        limit = 360 if timeframe == "1d" else 520
+        df = fetch_cc(symbol, "USD", timeframe, limit=limit)
+        datasets[timeframe] = df
+        close = df["close"]
+        derived[timeframe] = {
+            "rsi": rsi(close, 14),
+            "macd": None,
+            "macd_signal": None,
+            "macd_hist": None,
+            "ema": ema(close, 21 if timeframe != "1d" else 20),
+            "sma": close.rolling(55 if timeframe != "15m" else 34).mean(),
+        }
+        macd_line, macd_signal, macd_hist = macd(close, 12, 26, 9)
+        derived[timeframe]["macd"] = macd_line
+        derived[timeframe]["macd_signal"] = macd_signal
+        derived[timeframe]["macd_hist"] = macd_hist
+
+    d1 = datasets["1d"]
     close_d = d1["close"]
-    rsi_d = rsi(close_d, 14)
-    macd_d, sig_d, hist_d = macd(close_d, 12, 26, 9)
-    sma50_d = close_d.rolling(50).mean()
-
-    # سیگنال‌های روزانه جاری
-    rsi_d_last = float(rsi_d.iloc[-1])
+    atr_series = atr(d1, 14)
+    atr_value = float(atr_series.iloc[-1]) if not atr_series.empty else 0.0
     price_d_last = float(close_d.iloc[-1])
-    sma50_last = float(sma50_d.iloc[-1])
-    price_above_sma = price_d_last >= sma50_last * (1 - SMA_TOLERANCE_PCT)
-    price_below_sma = price_d_last <= sma50_last * (1 + SMA_TOLERANCE_PCT)
+    atr_pct = (atr_value / price_d_last * 100) if price_d_last else 0.0
+    volatile_market = atr_pct > 3.0
 
-    primary = last_cross_up(macd_d, sig_d) and (rsi_d_last >= BUY_RSI_D_MIN) and price_above_sma
-    sell_primary = last_cross_down(macd_d, sig_d) and (rsi_d_last <= SELL_RSI_D_MAX) and price_below_sma
+    dynamic_buy_rsi_floor = 40 if volatile_market else 35
 
-    # 4h (CryptoCompare)
-    h4 = fetch_cc(symbol, "USD", "4h", limit=320)
-    close_h4 = h4["close"]
-    rsi_h4 = rsi(close_h4, 14)
-    macd_h4, sig_h4, hist_h4 = macd(close_h4, 12, 26, 9)
-    price_now = float(close_h4.iloc[-1])
+    buy_confidence_total = 0.0
+    sell_confidence_total = 0.0
 
-    # ساپورت/مقاومت (برای XRP از لنگر 2.75 استفاده می‌کنیم؛ برای بقیه فقط لو/های اخیر)
-    recent_low = close_h4.tail(30).min()
-    recent_high = close_h4.tail(30).max()
+    label = pair or f"{symbol}USDT"
 
-    if name == "XRP":
-        near_anchor = near(price_now, 2.75, pct=NEAR_PCT)
-        support_ok = near_anchor or near(price_now, recent_low, pct=NEAR_PCT)
+    for timeframe, tf_label, weight in TIMEFRAME_CONFIG:
+        df = datasets[timeframe]
+        details: dict[str, float] = {}
+        close = df["close"]
+        price_last = float(close.iloc[-1])
+        price_prev = float(close.iloc[-2]) if len(close) > 1 else price_last
+        rsi_series = derived[timeframe]["rsi"]
+        rsi_last = float(rsi_series.iloc[-1])
+        macd_line = derived[timeframe]["macd"]
+        macd_signal = derived[timeframe]["macd_signal"]
+        macd_hist = derived[timeframe]["macd_hist"]
+        hist_last = float(macd_hist.iloc[-1])
+        ema_series = derived[timeframe]["ema"]
+        ema_last = float(ema_series.iloc[-1])
+        sma_series = derived[timeframe]["sma"]
+        sma_last = float(sma_series.iloc[-1]) if not pd.isna(sma_series.iloc[-1]) else ema_last
+        volume = df["volume"]
+        volume_ma = volume.rolling(20).mean()
+        vol_ma_last = float(volume_ma.iloc[-1]) if not pd.isna(volume_ma.iloc[-1]) else 0.0
+        volume_last = float(volume.iloc[-1])
+        volume_ratio = volume_last / vol_ma_last if vol_ma_last else 1.0
+
+        if timeframe == "1d":
+            buy_rsi_trigger = dynamic_buy_rsi_floor
+            sell_rsi_trigger = 70
+        elif timeframe == "4h":
+            buy_rsi_trigger = 40 if volatile_market else 37
+            sell_rsi_trigger = 65
+        else:  # 15m
+            buy_rsi_trigger = 42 if volatile_market else 38
+            sell_rsi_trigger = 60
+
+        buy_rsi_alignment = rsi_last <= buy_rsi_trigger
+        sell_rsi_alignment = rsi_last >= sell_rsi_trigger
+
+        if timeframe == "1d":
+            macd_buy_alignment = last_cross_up(macd_line, macd_signal) or (hist_last > 0 and volatile_market)
+            macd_sell_alignment = last_cross_down(macd_line, macd_signal) or (hist_last < 0 and volatile_market)
+        else:
+            macd_buy_alignment = (macd_line.iloc[-1] > macd_signal.iloc[-1]) and hist_last >= 0
+            macd_sell_alignment = (macd_line.iloc[-1] < macd_signal.iloc[-1]) and hist_last <= 0
+
+        trend_buy_alignment = price_last > ema_last and price_last > sma_last
+        trend_sell_alignment = price_last < ema_last and price_last < sma_last
+
+        volume_threshold = 1.05 if timeframe == "1d" else 1.1
+        volume_buy_alignment = volume_ratio >= volume_threshold and price_last >= price_prev
+        volume_sell_alignment = volume_ratio >= volume_threshold and price_last < price_prev
+
+        tf_buy_score = 0.0
+        tf_sell_score = 0.0
+
+        if buy_rsi_alignment:
+            tf_buy_score += INDICATOR_WEIGHTS["rsi"] * weight
+        if sell_rsi_alignment:
+            tf_sell_score += INDICATOR_WEIGHTS["rsi"] * weight
+
+        if macd_buy_alignment:
+            tf_buy_score += INDICATOR_WEIGHTS["macd"] * weight
+        if macd_sell_alignment:
+            tf_sell_score += INDICATOR_WEIGHTS["macd"] * weight
+
+        if trend_buy_alignment:
+            tf_buy_score += INDICATOR_WEIGHTS["trend"] * weight
+        if trend_sell_alignment:
+            tf_sell_score += INDICATOR_WEIGHTS["trend"] * weight
+
+        if volume_buy_alignment:
+            tf_buy_score += INDICATOR_WEIGHTS["volume"] * weight
+        if volume_sell_alignment:
+            tf_sell_score += INDICATOR_WEIGHTS["volume"] * weight
+
+        confidence_contrib_buy[tf_label] = tf_buy_score
+        confidence_contrib_sell[tf_label] = tf_sell_score
+        buy_confidence_total += tf_buy_score
+        sell_confidence_total += tf_sell_score
+
+        details.update(
+            {
+                "price": price_last,
+                "rsi": rsi_last,
+                "rsi_trigger_buy": buy_rsi_trigger,
+                "rsi_trigger_sell": sell_rsi_trigger,
+                "macd_hist": hist_last,
+                "ema": ema_last,
+                "sma": sma_last,
+                "volume_ratio": volume_ratio,
+                "buy_score": tf_buy_score * 100,
+                "sell_score": tf_sell_score * 100,
+            }
+        )
+
+        LOGGER.debug(
+            "analysis %s tf=%s rsi=%.2f macd_hist=%.4f ema=%.4f sma=%.4f vol_ratio=%.2f buy=%.1f sell=%.1f",
+            label,
+            tf_label,
+            rsi_last,
+            hist_last,
+            ema_last,
+            sma_last,
+            volume_ratio,
+            tf_buy_score * 100,
+            tf_sell_score * 100,
+        )
+
+        timeframe_details[tf_label] = details
+
+    buy_confidence = min(100.0, max(0.0, buy_confidence_total * 100))
+    sell_confidence = min(100.0, max(0.0, sell_confidence_total * 100))
+
+    best_direction = "BUY" if buy_confidence >= sell_confidence else "SELL"
+    best_confidence = buy_confidence if best_direction == "BUY" else sell_confidence
+    opposing_confidence = sell_confidence if best_direction == "BUY" else buy_confidence
+
+    signal_type = "NONE"
+    timeframe = ""
+    signal_strength = "none"
+    dominant_tf = ""
+
+    if best_confidence >= 65 and (best_confidence - opposing_confidence) >= 5:
+        signal_type = best_direction
+        dominant_lookup = confidence_contrib_buy if signal_type == "BUY" else confidence_contrib_sell
+        dominant_tf = max(dominant_lookup.items(), key=lambda item: item[1], default=("", 0.0))[0]
+        timeframe = dominant_tf
+        if best_confidence > 85:
+            signal_strength = "strong"
+        elif best_confidence >= 65:
+            signal_strength = "moderate"
     else:
-        support_ok = near(price_now, recent_low, pct=NEAR_PCT)
+        dominant_tf = max(
+            confidence_contrib_buy.items() if buy_confidence >= sell_confidence else confidence_contrib_sell.items(),
+            key=lambda item: item[1],
+            default=("", 0.0),
+        )[0]
 
-    near_res = near(price_now, recent_high, pct=NEAR_PCT)
+    bias: tuple[str, int] | None = None
+    signal_confidence = 0
+    cooldown_triggered = False
 
-    rsi_h4_last = float(rsi_h4.iloc[-1])
-    rsi_buy_band  = H4_RSI_BUY_MIN  <= rsi_h4_last <= H4_RSI_BUY_MAX
-    rsi_sell_band = H4_RSI_SELL_MIN <= rsi_h4_last <= H4_RSI_SELL_MAX
+    h15 = datasets["15m"]
+    last_timestamp = float(h15["time"].iloc[-1]) if "time" in h15 else time.time()
 
-    div_ok  = bullish_divergence(close_h4, rsi_h4)
-    div_neg = bearish_divergence(close_h4, rsi_h4)
+    if signal_type == "BUY":
+        signal_confidence = int(round(buy_confidence))
+    elif signal_type == "SELL":
+        signal_confidence = int(round(sell_confidence))
+    else:
+        if best_confidence > 50:
+            bias = (best_direction, int(round(best_confidence)))
 
-    macd_hist_ok  = float(hist_h4.iloc[-1]) > 0
-    macd_hist_neg = float(hist_h4.iloc[-1]) < 0
+    if signal_type in ("BUY", "SELL"):
+        previous = _SIGNAL_HISTORY.get(label)
+        if previous and previous.get("type") == signal_type:
+            if last_timestamp - previous.get("time", 0.0) < _COOLDOWN_SECONDS:
+                cooldown_triggered = True
+                bias = (signal_type, int(round(best_confidence)))
+                signal_type = "NONE"
+                timeframe = ""
+                signal_confidence = 0
+                signal_strength = "weak"
+        if signal_type in ("BUY", "SELL"):
+            _SIGNAL_HISTORY[label] = {"time": last_timestamp, "type": signal_type}
 
-    secondary       = support_ok and rsi_buy_band  and div_ok  and macd_hist_ok
-    sell_secondary  = near_res   and rsi_sell_band and div_neg and macd_hist_neg
+    if signal_type != "BUY" and signal_type != "SELL":
+        signal_strength = "weak" if best_confidence >= 50 else "none"
 
-    # انتخاب نهایی
-    signal_type = "NONE"; timeframe = ""
-    if primary:
-        signal_type, timeframe = "BUY", "Daily"
-    elif secondary:
-        signal_type, timeframe = "BUY", "4h"
-    elif sell_primary:
-        signal_type, timeframe = "SELL", "Daily"
-    elif sell_secondary:
-        signal_type, timeframe = "SELL", "4h"
+    rsi_d_series = derived["1d"]["rsi"]
+    macd_d = derived["1d"]["macd"]
+    sig_d = derived["1d"]["macd_signal"]
+    sma50_d = close_d.rolling(50).mean()
+    rsi_h4 = derived["4h"]["rsi"]
+    macd_h4_hist = derived["4h"]["macd_hist"]
 
-    # --- برآورد احتمال بر اساس بک‌تست تجربی ---
-    prob = avg_ret = None; horizon_label = ""
-    if signal_type != "NONE":
-        # DAILY flags
-        bu_flags_d, se_flags_d = historical_flags_daily(close_d, rsi_d, macd_d, sig_d, sma50_d)
-        # 4H flags
-        bu_flags_h = historical_flags_4h(close_h4, rsi_h4, hist_h4, for_buy=True)
-        se_flags_h = historical_flags_4h(close_h4, rsi_h4, hist_h4, for_buy=False)
+    prob = avg_ret = None
+    horizon_label = ""
+    if signal_type in ("BUY", "SELL"):
+        bu_flags_d, se_flags_d = historical_flags_daily(close_d, rsi_d_series, macd_d, sig_d, sma50_d)
+        h4 = datasets["4h"]
+        close_h4 = h4["close"]
+        bu_flags_h = historical_flags_4h(close_h4, rsi_h4, macd_h4_hist, for_buy=True)
+        se_flags_h = historical_flags_4h(close_h4, rsi_h4, macd_h4_hist, for_buy=False)
 
-        if timeframe == "Daily":
+        if timeframe == "1D":
             if signal_type == "BUY":
                 prob, avg_ret = prob_and_return_from_flags(close_d, bu_flags_d, DAILY_LOOKAHEAD_BARS, "BUY")
             else:
                 prob, avg_ret = prob_and_return_from_flags(close_d, se_flags_d, DAILY_LOOKAHEAD_BARS, "SELL")
             horizon_label = f"next {DAILY_LOOKAHEAD_BARS}D"
-        else:  # 4h
+        elif timeframe == "4H":
             if signal_type == "BUY":
                 prob, avg_ret = prob_and_return_from_flags(close_h4, bu_flags_h, H4_LOOKAHEAD_BARS, "BUY")
             else:
@@ -526,23 +751,53 @@ def evaluate_symbol(symbol: str, name: str, pair: str | None = None):
             horizon_label = f"next {H4_LOOKAHEAD_BARS}x4h"
 
     ctx = dict(
-        price=price_now,
-        rsi_d=rsi_d_last,
-        rsi_h4=rsi_h4_last,
-        hist_d=float((macd_d - sig_d).iloc[-1]),  # برای نمایش مختصر
-        hist_h4=float((macd_h4 - sig_h4).iloc[-1]),
-        sma50_d=sma50_last,
-        support_ok=support_ok,
-        div_ok=div_ok,
-        near_res=near_res,
-        div_neg=div_neg,
+        price=float(datasets["15m"]["close"].iloc[-1]),
+        atr_pct=atr_pct,
+        volatility="volatile" if volatile_market else "calm",
+        confidence=dict(
+            buy=buy_confidence,
+            sell=sell_confidence,
+            breakdown={
+                tf: {
+                    "buy": confidence_contrib_buy.get(tf, 0.0) * 100,
+                    "sell": confidence_contrib_sell.get(tf, 0.0) * 100,
+                }
+                for _, tf, _ in TIMEFRAME_CONFIG
+            },
+        ),
+        timeframes=timeframe_details,
+        dominant_timeframe=dominant_tf or timeframe,
+        cooldown_active=cooldown_triggered,
+        signal_strength=signal_strength,
     )
 
-    if signal_type == "NONE":
-        label = pair or f"{symbol}USDT"
-        LOGGER.debug("no condition met for %s", label)
+    if bias:
+        ctx["bias_direction"], ctx["bias_confidence"] = bias
 
-    return name, signal_type, timeframe, ctx, prob, avg_ret, horizon_label
+    LOGGER.debug(
+        "signal summary %s => buy=%.1f sell=%.1f best=%s conf=%.1f strength=%s atr=%.2f%% timeframe=%s",
+        label,
+        buy_confidence,
+        sell_confidence,
+        signal_type if signal_type != "NONE" else bias[0] if bias else "NONE",
+        best_confidence,
+        signal_strength,
+        atr_pct,
+        timeframe or "n/a",
+    )
+
+    return (
+        name,
+        signal_type,
+        timeframe,
+        ctx,
+        prob,
+        avg_ret,
+        horizon_label,
+        signal_confidence,
+        bias,
+        signal_strength,
+    )
 
 # ===================== اجرای اصلی =====================
 
@@ -620,13 +875,25 @@ def _evaluate_pair(pair: str) -> dict[str, object]:
     if not inst:
         raise ValueError(f"Unsupported instrument pair: {pair}")
     try:
-        name, sig, tf, ctx, prob, avg_ret, hz = evaluate_symbol(
+        (
+            name,
+            sig,
+            tf,
+            ctx,
+            prob,
+            avg_ret,
+            hz,
+            confidence,
+            bias,
+            strength,
+        ) = evaluate_symbol(
             inst.symbol,
             inst.display_name,
             inst.pair,
         )
         block = build_message_block(inst.display_name, inst.pair, sig, tf, ctx, prob, avg_ret, hz)
         signal_value = sig if sig in ("BUY", "SELL") else "NO ACTION"
+        summary_line = build_summary_line(inst.pair, signal_value, confidence, bias, strength)
         return {
             "pair": inst.pair,
             "name": inst.display_name,
@@ -636,6 +903,10 @@ def _evaluate_pair(pair: str) -> dict[str, object]:
             "prob": prob,
             "avg_ret": avg_ret,
             "horizon": hz,
+            "confidence": confidence,
+            "bias": bias,
+            "signal_strength": strength,
+            "summary_line": summary_line,
             "text": block,
         }
     except Exception as exc:
@@ -673,7 +944,7 @@ def _build_summary_from_results(
     for pair in sorted(results_by_pair):
         result = results_by_pair[pair]
         signal = str(result.get("signal") or "NO ACTION")
-        text = str(result.get("text") or "")
+        text = str(result.get("summary_line") or result.get("text") or "")
         canonical_pair = str(result.get("pair") or pair)
 
         if signal in ("BUY", "SELL"):
@@ -685,7 +956,7 @@ def _build_summary_from_results(
         else:
             counts["NO_ACTION"] += 1
 
-        highlights.append({"symbol": canonical_pair, "line": text})
+        highlights.append({"symbol": canonical_pair, "line": text, "signal_strength": result.get("signal_strength")})
 
     counts["emergencies_last_4h"] = emergencies
 
@@ -782,19 +1053,18 @@ def format_compact_summary(results: list[dict[str, object]]) -> str:
     groups = {"BUY": [], "SELL": [], "NO ACTION": []}
     errors: list[str] = []
     for res in results:
-        signal = res.get("signal")
-        pair = res.get("pair")
-        if signal in groups:
-            groups[signal].append(f"<b>{pair}</b>")
-        elif signal == "ERROR":
+        signal = str(res.get("signal") or "NO ACTION")
+        if signal == "ERROR":
             errors.append(str(res.get("text", "")))
-        else:
-            groups["NO ACTION"].append(f"<b>{pair}</b>")
+            continue
+        summary_line = str(res.get("summary_line") or res.get("text") or f"<b>{res.get('pair')}</b>")
+        groups.setdefault(signal, []).append(summary_line)
 
-    for key, title in (("BUY", "✅ BUY"), ("SELL", "⛔️ SELL"), ("NO ACTION", "⚪️ NO ACTION")):
-        values = groups[key]
+    for key, title in (("BUY", "🟢 BUY"), ("SELL", "🔴 SELL"), ("NO ACTION", "⚪ NO ACTION")):
+        values = groups.get(key) or []
         if values:
-            lines.append(f"{title}: " + ", ".join(values))
+            lines.append(title)
+            lines.extend(values)
         else:
             lines.append(f"{title}: —")
     if errors:
