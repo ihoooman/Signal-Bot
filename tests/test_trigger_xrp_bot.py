@@ -33,20 +33,63 @@ class EmergencyBroadcastTests(unittest.TestCase):
 
         self.ctx = {
             "price": 1.0,
-            "rsi_d": 60.0,
-            "rsi_h4": 40.0,
-            "hist_d": 0.1,
-            "hist_h4": 0.1,
-            "sma50_d": 0.9,
-            "support_ok": True,
-            "div_ok": True,
-            "near_res": False,
-            "div_neg": False,
+            "atr_pct": 2.0,
+            "volatility": "calm",
+            "confidence": {
+                "buy": 72.0,
+                "sell": 18.0,
+                "breakdown": {
+                    "1D": {"buy": 40.0, "sell": 5.0},
+                    "4H": {"buy": 22.0, "sell": 8.0},
+                    "15M": {"buy": 10.0, "sell": 5.0},
+                },
+            },
+            "timeframes": {
+                "1D": {
+                    "price": 1.0,
+                    "rsi": 38.0,
+                    "rsi_trigger_buy": 35.0,
+                    "rsi_trigger_sell": 70.0,
+                    "macd_hist": 0.1,
+                    "ema": 0.9,
+                    "sma": 0.95,
+                    "volume_ratio": 1.1,
+                    "buy_score": 35.0,
+                    "sell_score": 5.0,
+                },
+                "4H": {
+                    "price": 1.0,
+                    "rsi": 42.0,
+                    "rsi_trigger_buy": 37.0,
+                    "rsi_trigger_sell": 65.0,
+                    "macd_hist": 0.08,
+                    "ema": 0.88,
+                    "sma": 0.9,
+                    "volume_ratio": 1.2,
+                    "buy_score": 25.0,
+                    "sell_score": 8.0,
+                },
+                "15M": {
+                    "price": 1.0,
+                    "rsi": 45.0,
+                    "rsi_trigger_buy": 38.0,
+                    "rsi_trigger_sell": 60.0,
+                    "macd_hist": 0.02,
+                    "ema": 0.86,
+                    "sma": 0.87,
+                    "volume_ratio": 1.3,
+                    "buy_score": 12.0,
+                    "sell_score": 5.0,
+                },
+            },
+            "dominant_timeframe": "1D",
+            "cooldown_active": False,
+            "signal_strength": "moderate",
         }
 
     def test_emergency_only_sends_new_signals_across_restarts(self):
         with mock.patch.object(trigger_xrp_bot, "evaluate_symbol", return_value=(
-            "XRP", "BUY", "Daily", self.ctx, 0.6, 0.02, "next 3D"
+            "XRP", "BUY", "1D", self.ctx, 0.6, 0.02, "next 3D", 88, None, "strong"
         )) as mock_eval, mock.patch.object(trigger_xrp_bot, "broadcast") as mock_broadcast:
             sent = trigger_xrp_bot.run("emergency", emergency_state_path=self.state_path)
             self.assertTrue(sent)
@@ -60,7 +103,7 @@ class EmergencyBroadcastTests(unittest.TestCase):
 
         mock_broadcast.reset_mock()
         with mock.patch.object(trigger_xrp_bot, "evaluate_symbol", return_value=(
-            "XRP", "BUY", "Daily", self.ctx, 0.6, 0.02, "next 3D"
+            "XRP", "BUY", "1D", self.ctx, 0.6, 0.02, "next 3D", 88, None, "strong"
         )) as mock_eval, mock.patch.object(trigger_xrp_bot, "broadcast") as mock_broadcast:
             sent = trigger_xrp_bot.run("emergency", emergency_state_path=self.state_path)
             self.assertFalse(sent)
@@ -72,9 +115,9 @@ class EmergencyBroadcastTests(unittest.TestCase):
 
         def fake_eval(symbol, name, pair=None):
             if symbol == "XRP":
-                return name, "BUY", "Daily", self.ctx, 0.6, 0.02, "next 3D"
+                return name, "BUY", "1D", self.ctx, 0.6, 0.02, "next 3D", 88, None, "strong"
             if symbol == "BTC":
-                return name, "NONE", "", self.ctx, None, None, ""
+                return name, "NONE", "", self.ctx, None, None, "", 0, ("BUY", 55), "weak"
             raise AssertionError("Unexpected symbol")
 
         with mock.patch.object(trigger_xrp_bot, "evaluate_symbol", side_effect=fake_eval), \
@@ -85,17 +128,17 @@ class EmergencyBroadcastTests(unittest.TestCase):
             call = mock_broadcast.call_args
             message = call.kwargs.get("text", call.args[0])
             self.assertIn("SUMMARY REPORT", message)
-            self.assertIn("BUY", message)
-            self.assertIn("NO ACTION", message)
+            self.assertIn("🟢", message)
+            self.assertIn("⚪", message)
 
     def test_generate_on_demand_update_includes_emergency(self):
         add_to_watchlist(111, "BTCUSDT", path=self.subs_path)
 
         def fake_eval(symbol, name, pair=None):
             if symbol == "XRP":
-                return name, "BUY", "Daily", self.ctx, 0.6, 0.02, "next 3D"
+                return name, "BUY", "1D", self.ctx, 0.6, 0.02, "next 3D", 88, None, "strong"
             if symbol == "BTC":
-                return name, "SELL", "Daily", self.ctx, 0.7, 0.03, "next 3D"
+                return name, "SELL", "4H", self.ctx, 0.7, 0.03, "next 3D", 82, None, "moderate"
             raise AssertionError("Unexpected symbol")
 
         with mock.patch.object(trigger_xrp_bot, "evaluate_symbol", side_effect=fake_eval):
