@@ -7,13 +7,14 @@ import logging
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 from zoneinfo import ZoneInfo
 from datetime import datetime
 
 import listen_start
-from trigger_xrp_bot import generate_snapshot_payload, run as run_broadcast
+from trigger_xrp_bot import generate_snapshot_payload, run as run_broadcast, run_optimize
 
 
 LOGGER = logging.getLogger(__name__)
@@ -105,12 +106,30 @@ def _mode_snapshot() -> None:
     _commit_and_push_snapshot(snapshot_path)
 
 
+def _mode_optimize() -> None:
+    started_at = time.perf_counter()
+    results = run_optimize()
+    for symbol, path in results.items():
+        LOGGER.info("optimized params %s -> %s", symbol, path)
+    payload = {
+        "job": "optimize",
+        "total": len(results),
+        "actionable": 0,
+        "watch": 0,
+        "experimental": 0,
+        "avg_conf": 0.0,
+        "market": {"risk": "neutral"},
+        "duration_ms": int(max(0.0, (time.perf_counter() - started_at) * 1000.0)),
+    }
+    LOGGER.info(json.dumps(payload, sort_keys=True))
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="CI entry point for Signal Bot")
     parser.add_argument(
         "--mode",
         required=True,
-        choices=["prehandle", "emergency", "summary", "snapshot"],
+        choices=["prehandle", "emergency", "summary", "snapshot", "optimize"],
         help="Select pipeline stage to run",
     )
     return parser.parse_args(argv)
@@ -128,6 +147,8 @@ def main(argv: list[str] | None = None) -> None:
         _mode_summary()
     elif args.mode == "snapshot":
         _mode_snapshot()
+    elif args.mode == "optimize":
+        _mode_optimize()
     else:  # pragma: no cover - argparse prevents
         raise SystemExit(f"Unknown mode: {args.mode}")
 
