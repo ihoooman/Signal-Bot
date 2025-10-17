@@ -22,6 +22,22 @@ import requests
 from dotenv import load_dotenv
 from zoneinfo import ZoneInfo
 
+
+import os
+import sys
+from pathlib import Path
+import numpy as np
+import pandas as pd
+import requests
+from dotenv import load_dotenv
+from zoneinfo import ZoneInfo
+
+def get_bot_token() -> str:
+    token = os.getenv("BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN")
+    if not token:
+        raise RuntimeError("BOT_TOKEN is required (set in .env or environment)")
+    return token
+
 SRC_DIR = Path(__file__).resolve().parent / "src"
 if SRC_DIR.exists():
     sys.path.insert(0, str(SRC_DIR))
