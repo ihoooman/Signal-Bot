@@ -22,6 +22,16 @@ import requests
 from dotenv import load_dotenv
 from zoneinfo import ZoneInfo
 
+
+import os
+import sys
+from pathlib import Path
+import numpy as np
+import pandas as pd
+import requests
+from dotenv import load_dotenv
+from zoneinfo import ZoneInfo
+
 def get_bot_token() -> str:
     token = os.getenv("BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN")
     if not token:
