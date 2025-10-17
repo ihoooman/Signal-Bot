@@ -1,6 +1,7 @@
 requests
 pandas
 numpy
+pandas_ta
 python-dotenv>=1.0.1
 tzdata
 APScheduler
