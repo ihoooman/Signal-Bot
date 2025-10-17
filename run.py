@@ -56,7 +56,7 @@ def _run_periodic_scheduler(mode: str, interval_hours: float) -> None:
         time.sleep(interval_seconds)
 
 
-def _start_scheduler_threads() -> tuple[threading.Thread, threading.Thread]:
+def _start_scheduler_threads() -> tuple[threading.Thread, threading.Thread, threading.Thread]:
     summary_thread = threading.Thread(
         target=_run_periodic_scheduler,
         args=("summary", 4.0),
@@ -69,9 +69,16 @@ def _start_scheduler_threads() -> tuple[threading.Thread, threading.Thread]:
         name="auto-emergency",
         daemon=True,
     )
+    optimize_thread = threading.Thread(
+        target=_run_periodic_scheduler,
+        args=("optimize", 24.0),
+        name="auto-optimize",
+        daemon=True,
+    )
     summary_thread.start()
     emergency_thread.start()
-    return summary_thread, emergency_thread
+    optimize_thread.start()
+    return summary_thread, emergency_thread, optimize_thread
 # --- automatic scheduler setup (end) ---
 
 

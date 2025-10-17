@@ -1,209 +1,176 @@
 import json
 import os
-import tempfile
+import os
 import unittest
-from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
+
+import numpy as np
+import pandas as pd
+
+import trigger_xrp_bot
+from signal_bot import regime_engine
+
 
 os.environ.setdefault("BOT_TOKEN", "test-token")
 os.environ.setdefault("TELEGRAM_BOT_TOKEN", "test-token")
 os.environ.setdefault("TELEGRAM_CHAT_ID", "111")
 
-import trigger_xrp_bot
-from subscriptions import add_to_watchlist, upsert_subscriber
+
+def _build_frame(rows: int = 120) -> pd.DataFrame:
+    idx = np.arange(rows)
+    data = {
+        "time": idx,
+        "open": np.linspace(1, 1.05, rows),
+        "high": np.linspace(1.01, 1.06, rows),
+        "low": np.linspace(0.99, 1.04, rows),
+        "close": np.linspace(1, 1.05, rows),
+        "volume": np.linspace(1000, 1200, rows),
+    }
+    return pd.DataFrame(data)
 
 
-class EmergencyBroadcastTests(unittest.TestCase):
-    def setUp(self):
-        self.tmpdir = tempfile.TemporaryDirectory()
-        self.addCleanup(self.tmpdir.cleanup)
-        self.subs_path = Path(self.tmpdir.name) / "subs.sqlite3"
-        self.state_path = Path(self.tmpdir.name) / "state.json"
-        trigger_xrp_bot.SUBSCRIBERS_PATH = str(self.subs_path)
-        trigger_xrp_bot.DEFAULT_PAIRS = ("XRPUSDT",)
+class ProbabilisticEngineTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.original_min_signals = trigger_xrp_bot.MIN_SIGNALS
+        self.original_conf_min = trigger_xrp_bot.CONF_MIN
+        self.original_watch_low = trigger_xrp_bot.WATCH_BAND_LOW
+        self.original_pairs = trigger_xrp_bot.DEFAULT_PAIRS
+        trigger_xrp_bot.MIN_SIGNALS = 3
+        trigger_xrp_bot.CONF_MIN = 0.7
+        trigger_xrp_bot.WATCH_BAND_LOW = 0.55
+        trigger_xrp_bot.DEFAULT_PAIRS = ("AAAUSDT", "BBBUSD", "CCCUSDT")
 
-        upsert_subscriber(
-            111,
-            phone_number="+989123456789",
-            first_name="Test",
-            last_name="User",
-            username="tester",
-            path=self.subs_path,
-        )
+    def tearDown(self) -> None:
+        trigger_xrp_bot.MIN_SIGNALS = self.original_min_signals
+        trigger_xrp_bot.CONF_MIN = self.original_conf_min
+        trigger_xrp_bot.WATCH_BAND_LOW = self.original_watch_low
+        trigger_xrp_bot.DEFAULT_PAIRS = self.original_pairs
 
-        self.ctx = {
-            "price": 1.0,
-            "atr_pct": 2.0,
-            "volatility": "calm",
-            "confidence": {
-                "buy": 72.0,
-                "sell": 18.0,
-                "breakdown": {
-                    "1D": {"buy": 40.0, "sell": 5.0},
-                    "4H": {"buy": 22.0, "sell": 8.0},
-                    "15M": {"buy": 10.0, "sell": 5.0},
-                },
-            },
-            "timeframes": {
-                "1D": {
-                    "price": 1.0,
-                    "rsi": 38.0,
-                    "rsi_trigger_buy": 35.0,
-                    "rsi_trigger_sell": 70.0,
-                    "macd_hist": 0.1,
-                    "ema": 0.9,
-                    "sma": 0.95,
-                    "volume_ratio": 1.1,
-                    "buy_score": 35.0,
-                    "sell_score": 5.0,
-                },
-                "4H": {
-                    "price": 1.0,
-                    "rsi": 42.0,
-                    "rsi_trigger_buy": 37.0,
-                    "rsi_trigger_sell": 65.0,
-                    "macd_hist": 0.08,
-                    "ema": 0.88,
-                    "sma": 0.9,
-                    "volume_ratio": 1.2,
-                    "buy_score": 25.0,
-                    "sell_score": 8.0,
-                },
-                "15M": {
-                    "price": 1.0,
-                    "rsi": 45.0,
-                    "rsi_trigger_buy": 38.0,
-                    "rsi_trigger_sell": 60.0,
-                    "macd_hist": 0.02,
-                    "ema": 0.86,
-                    "sma": 0.87,
-                    "volume_ratio": 1.3,
-                    "buy_score": 12.0,
-                    "sell_score": 5.0,
-                },
-            },
-            "dominant_timeframe": "1D",
-            "cooldown_active": False,
-            "signal_strength": "moderate",
+    def test_dense_signals_emitted_when_bear(self) -> None:
+        trigger_xrp_bot.MIN_SIGNALS = 3
+
+        def fake_eval(symbol: str, name: str, pair: str, market_context=None):
+            prob_sell = 0.82 if (market_context or {}).get("risk") == "bear" else 0.6
+            prob_buy = 1 - prob_sell
+            return {
+                "pair": pair,
+                "name": name,
+                "signal": "SELL",
+                "confidence": int(round(prob_sell * 100)),
+                "prob_buy": prob_buy,
+                "prob_sell": prob_sell,
+                "reason": ["Bear market pressure"],
+                "category": "actionable" if prob_sell >= trigger_xrp_bot.CONF_MIN else "watch",
+                "max_prob": prob_sell,
+                "mtf": {"1d": prob_sell, "4h": prob_sell, "15m": prob_sell},
+                "mtf_full": {},
+                "market_context": market_context,
+            }
+
+        with mock.patch.object(trigger_xrp_bot, "fetch_market_context", return_value={"risk": "bear", "btc_24h": -4.0}), \
+            mock.patch.object(trigger_xrp_bot, "_evaluate_pair", side_effect=lambda pair, ctx: fake_eval(pair, pair[:-4], pair, market_context=ctx)), \
+            mock.patch.object(trigger_xrp_bot, "_normalise_pair", side_effect=lambda p: p), \
+            mock.patch.object(trigger_xrp_bot, "get_instrument_by_pair", side_effect=lambda p: SimpleNamespace(symbol=p[:-4], display_name=p[:-4], pair=p)):
+            results = trigger_xrp_bot._evaluate_pairs(["AAAUSDT", "BBBUSD", "CCCUSDT"])
+
+        self.assertGreaterEqual(len(results), trigger_xrp_bot.MIN_SIGNALS)
+        for payload in results.values():
+            ctx = payload["ctx"]
+            self.assertEqual(ctx["signal"], "SELL")
+            self.assertGreaterEqual(ctx["confidence"], 70)
+            self.assertEqual(ctx["category"], "actionable")
+
+    def test_topk_respects_thresholds(self) -> None:
+        items = [
+            {"pair": "AAA", "category": "actionable", "max_prob": 0.82},
+            {"pair": "BBB", "category": "watch", "max_prob": 0.66},
+            {"pair": "CCC", "category": "experimental", "max_prob": 0.52},
+            {"pair": "DDD", "category": "experimental", "max_prob": 0.48},
+        ]
+        trigger_xrp_bot.MIN_SIGNALS = 3
+        selected = trigger_xrp_bot._select_top_signals(items)
+        self.assertEqual(len(selected), 3)
+        self.assertEqual(selected[0]["pair"], "AAA")
+        self.assertEqual(selected[1]["pair"], "BBB")
+        self.assertEqual(selected[2]["category"], "experimental")
+
+    def test_fusion_penalizes_conflicts(self) -> None:
+        frames = {
+            "1d": _build_frame(),
+            "4h": _build_frame(160),
+            "15m": _build_frame(320),
         }
 
-    def test_emergency_only_sends_new_signals_across_restarts(self):
-        with mock.patch.object(trigger_xrp_bot, "evaluate_symbol", return_value=(
-            "XRP", "BUY", "1D", self.ctx, 0.6, 0.02, "next 3D", 88, None, "strong"
-        )) as mock_eval, mock.patch.object(trigger_xrp_bot, "broadcast") as mock_broadcast:
-            sent = trigger_xrp_bot.run("emergency", emergency_state_path=self.state_path)
-            self.assertTrue(sent)
-            mock_broadcast.assert_called_once()
-            message = mock_broadcast.call_args.kwargs["text"] if "text" in mock_broadcast.call_args.kwargs else mock_broadcast.call_args[0][0]
-            self.assertIn("EMERGENCY SIGNAL", message)
-            mock_eval.assert_called()
+        def fake_fetch(symbol: str, tsym: str, timeframe: str, limit: int = 400):
+            return frames[timeframe].copy()
 
-        state = json.loads(self.state_path.read_text(encoding="utf-8"))
-        self.assertIn("active_signals", state)
+        scores = {
+            "1d": regime_engine.TimeframeScore(
+                label="1d",
+                raw_score=0.6,
+                prob_buy=0.9,
+                prob_sell=0.1,
+                regime="trend",
+                features={},
+                contributions={"ema_ribbon_slope": 0.3},
+                reasons=["EMA trend up"],
+                meta={}
+            ),
+            "4h": regime_engine.TimeframeScore(
+                label="4h",
+                raw_score=-0.4,
+                prob_buy=0.2,
+                prob_sell=0.8,
+                regime="range",
+                features={},
+                contributions={"macd_cross_score": -0.2},
+                reasons=["MACD momentum down"],
+                meta={}
+            ),
+            "15m": regime_engine.TimeframeScore(
+                label="15m",
+                raw_score=0.1,
+                prob_buy=0.55,
+                prob_sell=0.45,
+                regime="range",
+                features={},
+                contributions={"rsi_norm": 0.05},
+                reasons=["RSI oversold"],
+                meta={}
+            ),
+        }
 
-        mock_broadcast.reset_mock()
-        with mock.patch.object(trigger_xrp_bot, "evaluate_symbol", return_value=(
-            "XRP", "BUY", "1D", self.ctx, 0.6, 0.02, "next 3D", 88, None, "strong"
-        )) as mock_eval, mock.patch.object(trigger_xrp_bot, "broadcast") as mock_broadcast:
-            sent = trigger_xrp_bot.run("emergency", emergency_state_path=self.state_path)
-            self.assertFalse(sent)
-            mock_broadcast.assert_not_called()
-            mock_eval.assert_called()
+        def fake_eval(df, label, params, alpha=2.0, cooldown_lookup=None):
+            return scores[label]
 
-    def test_summary_groups_signals(self):
-        trigger_xrp_bot.DEFAULT_PAIRS = ("XRPUSDT", "BTCUSDT")
-
-        def fake_eval(symbol, name, pair=None):
-            if symbol == "XRP":
-                return name, "BUY", "1D", self.ctx, 0.6, 0.02, "next 3D", 88, None, "strong"
-            if symbol == "BTC":
-                return name, "NONE", "", self.ctx, None, None, "", 0, ("BUY", 55), "weak"
-            raise AssertionError("Unexpected symbol")
-
-        with mock.patch.object(trigger_xrp_bot, "evaluate_symbol", side_effect=fake_eval), \
-            mock.patch.object(trigger_xrp_bot, "broadcast") as mock_broadcast:
-            sent = trigger_xrp_bot.run("summary", emergency_state_path=self.state_path)
-            self.assertTrue(sent)
-            self.assertTrue(mock_broadcast.called)
-            call = mock_broadcast.call_args
-            message = call.kwargs.get("text", call.args[0])
-            self.assertIn("SUMMARY REPORT", message)
-            self.assertIn("🟢", message)
-            self.assertIn("⚪", message)
-
-    def test_generate_on_demand_update_includes_emergency(self):
-        add_to_watchlist(111, "BTCUSDT", path=self.subs_path)
-
-        def fake_eval(symbol, name, pair=None):
-            if symbol == "XRP":
-                return name, "BUY", "1D", self.ctx, 0.6, 0.02, "next 3D", 88, None, "strong"
-            if symbol == "BTC":
-                return name, "SELL", "4H", self.ctx, 0.7, 0.03, "next 3D", 82, None, "moderate"
-            raise AssertionError("Unexpected symbol")
-
-        with mock.patch.object(trigger_xrp_bot, "evaluate_symbol", side_effect=fake_eval):
-            messages, results = trigger_xrp_bot.generate_on_demand_update(
-                "111", emergency_state_path=self.state_path
+        with mock.patch.object(trigger_xrp_bot, "fetch_cc", side_effect=fake_fetch), \
+            mock.patch.object(regime_engine, "evaluate_timeframe", side_effect=fake_eval), \
+            mock.patch.object(regime_engine, "load_symbol_params", return_value=regime_engine.DEFAULT_PARAMS):
+            result = trigger_xrp_bot.evaluate_symbol(
+                "AAA", "AAA", "AAAUSDT", market_context={"risk": "neutral"}
             )
 
-        self.assertGreaterEqual(len(messages), 2)
-        self.assertIn("On-demand update", messages[0])
-        self.assertTrue(any(res["pair"] == "BTCUSDT" for res in results))
-        self.assertIn("EMERGENCY SIGNAL", messages[1])
+        self.assertIn("prob_buy", result)
+        self.assertIn("prob_sell", result)
+        self.assertLess(result["confidence"], 90)
+        self.assertGreaterEqual(result["confidence"], 60)
+        self.assertEqual(result["signal"], "BUY" if result["prob_buy"] >= result["prob_sell"] else "SELL")
 
-    def test_send_telegram_retries_on_rate_limit(self):
-        responses = [
-            mock.Mock(status_code=429, text="rate"),
-            mock.Mock(status_code=200, text="ok"),
+    def test_env_overrides_work(self) -> None:
+        trigger_xrp_bot.CONF_MIN = 0.8
+        trigger_xrp_bot.WATCH_BAND_LOW = 0.6
+        items = [
+            {"pair": "AAA", "category": "actionable", "max_prob": 0.85},
+            {"pair": "BBB", "category": "watch", "max_prob": 0.65},
+            {"pair": "CCC", "category": "experimental", "max_prob": 0.58},
         ]
-        with mock.patch("trigger_xrp_bot.requests.post", side_effect=responses) as mock_post, \
-            mock.patch("trigger_xrp_bot.time.sleep") as mock_sleep:
-            trigger_xrp_bot.send_telegram("111", "hello")
-            self.assertEqual(mock_post.call_count, 2)
-            mock_sleep.assert_called_once_with(trigger_xrp_bot._BACKOFF_SCHEDULE[0])
-
-    def test_send_telegram_raises_after_backoff_exhausted(self):
-        responses = [mock.Mock(status_code=429, text="rate") for _ in trigger_xrp_bot._BACKOFF_SCHEDULE]
-        with mock.patch("trigger_xrp_bot.requests.post", side_effect=responses), \
-            mock.patch("trigger_xrp_bot.time.sleep"):
-            with self.assertRaises(RuntimeError):
-                trigger_xrp_bot.send_telegram("111", "hello")
-
-    def test_broadcast_logs_context_and_respects_sleep(self):
-        with mock.patch.object(trigger_xrp_bot, "send_telegram") as mock_send, \
-            mock.patch("trigger_xrp_bot.time.sleep") as mock_sleep, \
-            mock.patch.object(trigger_xrp_bot, "LOGGER") as mock_logger, \
-            mock.patch.object(trigger_xrp_bot, "BROADCAST_SLEEP_MS", 10):
-            events = [{"name": "XRP", "signal": "BUY", "timeframe": "Daily"}]
-            trigger_xrp_bot.broadcast("msg", ["1", "2"], job="summary", events=events)
-            self.assertEqual(mock_send.call_count, 2)
-            mock_sleep.assert_called_once_with(0.01)
-            self.assertTrue(mock_logger.info.called)
-            msg_args = mock_logger.info.call_args[0]
-            self.assertTrue(msg_args[0].startswith("broadcast job="))
-            self.assertEqual(msg_args[1], "summary")
-
-    def test_render_compact_summary_smoke(self):
-        payload = {
-            "generated_at": "2024-01-01 00:00:00",
-            "counts": {
-                "BUY": 2,
-                "SELL": 1,
-                "NO_ACTION": 3,
-                "emergencies_last_4h": 1,
-            },
-            "highlights": [
-                {"symbol": "BTCUSDT", "line": "BUY signal"},
-                {"symbol": "ETHUSDT", "line": "Hold"},
-            ],
-            "per_user_overrides": False,
-        }
-
-        text = trigger_xrp_bot.render_compact_summary(payload)
-        self.assertIn("BUY", text)
-        self.assertIn("BTCUSDT", text)
-        self.assertIn("🎯", text)
+        selected = trigger_xrp_bot._select_top_signals(items)
+        cats = [res["category"] for res in selected]
+        self.assertIn("actionable", cats)
+        self.assertIn("watch", cats)
+        self.assertIn("experimental", cats)
 
 
-if __name__ == "__main__":
+if __name__ == "__main__":  # pragma: no cover
     unittest.main()

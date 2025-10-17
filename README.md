@@ -50,7 +50,15 @@ CRYPTOCOMPARE_API_KEY=cryptocompare-api-key (optional)
 # DONATION_TIERS=100,500,1000  # Telegram Stars donation buttons
 # ADMIN_CHAT_IDS=123456789     # Comma-separated admin chat ids for /donations and /refund
 # TIMEZONE=Asia/Tehran         # Override the scheduler timezone if needed
+CONF_MIN=0.70                 # Minimum probability for actionable ideas
+MIN_SIGNALS=8                 # Emit at least this many symbols per summary
+ALPHA_SIGMOID=2.0             # Logistic sharpness for probability mapping
+BEAR_SELL_BOOST=1.15          # Multiplier when global context is risk-off
+RISKON_BUY_BOOST=1.10         # Multiplier when global context is risk-on
+WATCH_BAND_LOW=0.55           # Lower bound for watchlist classification
 ```
+
+Actionable ideas require `CONF_MIN` (default 70%) and sit in the 🟢 section. Entries that clear `WATCH_BAND_LOW` but not `CONF_MIN` appear under 🟡 Watch, while the ⚪ Experimental bucket backfills until at least `MIN_SIGNALS` symbols are published. Summary/emergency runs log a JSON line per job with counts, average confidence, and the detected market regime for monitoring.
 
 Tips:
 - Set `ENV_FILE` in the environment to point at a custom config file if you deploy outside the repo root.
@@ -156,6 +164,8 @@ Secrets to configure:
 > **Worker mode:** When you run a dedicated poller (for example a Render Worker) keep the process scale at 1 and disable the `prehandle` stage in GitHub Actions. Only one consumer should call `getUpdates` at a time to avoid duplicate prompts.
 
 If APScheduler is unavailable in your environment, `schedule_jobs.py` will log a warning and exit so you can fall back to an external cron or workflow runner without the bot crashing.
+
+The bundled `run.py` daemon now launches three background schedulers: a 4-hour summary sweep, a 2-hour emergency sweep, and a once-per-day optimize run (`python -m src.signal_bot.ci_entry --mode optimize`) on the Asia/Tehran clock so rolling backtests keep symbol parameters tuned automatically.
 
 ## Repository layout
 - `trigger_xrp_bot.py` — signal engine and Telegram broadcaster.
